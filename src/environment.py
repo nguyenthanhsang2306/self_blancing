@@ -28,8 +28,9 @@ class SelfBalancingRobotEnv:
         self.max_pwm = p['max_pwm']
         self.g = 9.81
 
-        self.history_len = config['rl_hyperparameters']['history_len']
-        self.obs_dim = config['rl_hyperparameters']['input_dim']
+        rl_hp = config.get('rl_hyperparameters', {})
+        self.history_len = rl_hp.get('history_len', 3)
+        self.obs_dim = rl_hp.get('input_dim', 10)
 
         self.reset()
 

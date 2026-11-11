@@ -1,0 +1,14 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output artifacts (ignore heavy numpy weights & plots, keep directories)
+outputs/checkpoints/*.npy
+outputs/figures/*.png
+
+# Temp / Cache
+Simulink_Cache/
+Temp/
+.idea/
+.vscode/

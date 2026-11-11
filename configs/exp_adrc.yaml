@@ -1,0 +1,41 @@
+# ==============================================================================
+# EXPERIMENT 2: ACTIVE DISTURBANCE REJECTION CONTROL (3RD-ORDER LESO)
+# ==============================================================================
+
+system:
+  experiment_name: "exp_adrc_eso"
+  mode: "adrc"
+  seed: 42
+  device: "cpu"
+  output_dir: "outputs"
+
+robot_physics:
+  M: 0.360
+  m: 0.030
+  l: 0.031
+  r: 0.020
+  J: 0.00072
+  b: 0.050
+  Km: 0.28
+  V_bat: 7.4
+  deadband: 80.0
+  Ts: 0.005
+  max_pwm: 999.0
+  latency_steps: 1
+
+adrc_controller:
+  b0: 4.3135
+  omega_o: 48.0
+  omega_c: 18.5
+  pos_kp: 2.005
+  pos_kd: 3.151
+
+environment:
+  sim_duration: 3.0
+  initial_tilt_deg: 10.0
+  kick_force: -1.2
+  kick_start_time: 1.0
+  kick_duration: 0.08
+  domain_randomization:
+    enabled: false
+
