@@ -1,0 +1,67 @@
+# ==============================================================================
+# CONFIGURATION: ULTRA-ROBUST SELF-BALANCING ROBOT (STM32L476RG + GA12-N20)
+# ==============================================================================
+
+system:
+  experiment_name: "ultra_robust_rl_adrc"
+  seed: 42
+  device: "cpu"
+  output_dir: "outputs"
+
+robot_physics:
+  M: 0.360            # Chassis mass (kg)
+  m: 0.030            # Single wheel mass (kg)
+  l: 0.031            # CoG distance from wheel axle (m)
+  r: 0.020            # Wheel radius (m, diameter 40mm)
+  J: 0.00072          # Moment of inertia about CoG (kg*m^2)
+  b: 0.050            # Viscous friction damping coefficient (N*s/m)
+  Km: 0.28            # GA12-N20 motor torque/voltage factor (N/V)
+  V_bat: 7.4          # 2S LiPo nominal voltage (V)
+  deadband: 80.0      # Motor deadband threshold (PWM out of 999)
+  Ts: 0.005           # Control cycle period (200 Hz on TIM6 interrupt)
+  max_pwm: 999.0      # Maximum hardware timer ARR count (TIM1 16-bit)
+  latency_steps: 1    # 1-step sensor-to-actuator hardware delay (5 ms)
+
+baseline_pid:
+  kp_angle: 55.85     # Inner balance loop proportional gain
+  kd_angle: 3.84      # Inner balance loop derivative gain
+  kp_pos: 2.005       # Outer position loop proportional gain
+  kd_pos: 3.151       # Outer position loop derivative gain
+
+adrc_controller:
+  b0: 4.3135          # Nominal system control gain (deg / (s^2 * PWM))
+  omega_o: 48.0       # Observer bandwidth (rad/s) for ultra-stiff disturbance rejection
+  omega_c: 18.5       # Controller bandwidth (rad/s)
+  pos_kp: 2.005       # Outer position loop proportional gain
+  pos_kd: 3.151       # Outer position loop velocity damping
+
+rl_hyperparameters:
+  history_len: 3      # Temporal history steps
+  input_dim: 10       # [theta, dtheta, x, v, u_last, delta_theta, delta_dtheta, delta_x, delta_v, u_prev2]
+  hidden_dims: [32, 32]
+  output_dim: 1       # Residual torque delta u
+  action_scale: 450.0 # Bounded residual action limit (+/- 450 PWM)
+  population_size: 64 # Evolutionary search population
+  num_generations: 120
+  learning_rate: 0.05
+  sigma: 0.08         # Mutation perturbation standard deviation
+  patience: 25        # Early stopping patience if no reward improvement
+
+environment:
+  sim_duration: 3.0   # Episode duration (seconds)
+  initial_tilt_deg: 10.0 # Initial disturbance angle (degrees)
+  kick_force: -1.2    # Strong external punch force (N)
+  kick_start_time: 1.0 # Timing of shock disturbance (s)
+  kick_duration: 0.08 # Duration of impulse (s)
+  domain_randomization:
+    enabled: true
+    mass_variation: 0.25      # +/- 25% payload variation
+    friction_variation: 0.30  # Floor friction variation
+    battery_sag_pct: 0.15     # Voltage sag under high current
+
+export:
+  export_c_headers: true
+  header_output_dir: "outputs/firmware_headers"
+  checkpoint_dir: "outputs/checkpoints"
+  figures_dir: "outputs/figures"
+
