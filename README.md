@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Ultra-Robust Two-Wheeled Self-Balancing Robot: Hybrid ADRC & Residual RL Suite
 
 [![Hardware Target](https://img.shields.io/badge/Hardware-STM32L476RG%20(ARM%20Cortex--M4%20%40%2080MHz)-blue.svg)]()
@@ -162,3 +163,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 ```
 Inference takes **~12 microseconds** on the Cortex-M4 with FPU enabled, consuming **less than 0.3% of the 5 ms control period**.
 
+=======
+# self_blancing
+>>>>>>> 353ed523b8b1515d0ebeb7a9062e52a10813cdbf
