@@ -23,12 +23,12 @@ except ImportError:
 
 class SelfBalancingGymEnv(gym.Env):
     """
-    Môi trường Gymnasium nâng cao (Anti-Reward-Hacking & True Balancing):
+    Môi trường Gymnasium chuẩn hóa (Dead-Stiff & Anti-Limit-Cycle):
       1. Động lực học phi tuyến Runge-Kutta 2 (Midpoint) tại 200 Hz (Ts = 5ms).
-      2. Siết góc ngã fall_angle = 12.0° để ngăn AI "hack điểm" bằng cách chạy tháo lui.
-      3. Observation Space: Vector 9D [s_t, s_{t-1}, a_{t-1}].
-      4. Hàm thưởng chống chạy lùi:
-         Chỉ trao r_alive khi |theta| < 6°, phạt nặng vận tốc di chuyển w_vel = 0.50.
+      2. Observation Space: Vector 9D [s_t, s_{t-1}, a_{t-1}].
+      3. Hàm thưởng triệt tiêu dao động hình sin:
+         Khâu cản vận tốc góc (w_dtheta = 2.0) và khâu cản vận tốc tịnh tiến (w_vel = 1.0)
+         cực mạnh để triệt tiêu hoàn toàn hiện tượng con lắc võng (overshoot/limit cycle).
     """
     metadata = {"render_modes": ["human"], "render_fps": 200}
 
@@ -58,7 +58,7 @@ class SelfBalancingGymEnv(gym.Env):
         self.action_mode = env_cfg.get('action_mode', 'continuous')
         self.discrete_levels = np.array(env_cfg.get('discrete_actions', [-1.0, -0.3, -0.1, 0.0, 0.1, 0.3, 1.0]), dtype=np.float32)
         self.max_steps = env_cfg.get('max_episode_steps', 1000)
-        self.fall_angle = math.radians(env_cfg.get('fall_angle_deg', 12.0))
+        self.fall_angle = math.radians(env_cfg.get('fall_angle_deg', 15.0))
         self.pos_limit = env_cfg.get('position_limit_m', 1.0)
         self.target_x = env_cfg.get('target_position', 0.0)
 
@@ -72,15 +72,15 @@ class SelfBalancingGymEnv(gym.Env):
         self.imu_noise_std = math.radians(dr.get('imu_noise_std_deg', 0.02))
         self.gyro_noise_std = math.radians(dr.get('gyro_noise_std_dps', 0.20))
 
-        # Cấu hình hàm thưởng
+        # Cấu hình hàm thưởng triệt tiêu dao động
         rw = config.get('reward_weights', {})
         self.r_alive = rw.get('r_alive', 1.0)
-        self.w_theta = rw.get('w_theta', 30.0)
-        self.w_dtheta = rw.get('w_dtheta', 0.60)
-        self.w_pos = rw.get('w_pos', 1.50)
-        self.w_vel = rw.get('w_vel', 0.50)
-        self.w_action = rw.get('w_action', 0.01)
-        self.w_action_diff = rw.get('w_action_diff', 0.05)
+        self.w_theta = rw.get('w_theta', 35.0)
+        self.w_dtheta = rw.get('w_dtheta', 2.00)
+        self.w_pos = rw.get('w_pos', 0.08)
+        self.w_vel = rw.get('w_vel', 1.00)
+        self.w_action = rw.get('w_action', 0.005)
+        self.w_action_diff = rw.get('w_action_diff', 0.04)
         self.fall_penalty = rw.get('fall_penalty', 100.0)
 
         # Định nghĩa Observation Space
@@ -150,8 +150,8 @@ class SelfBalancingGymEnv(gym.Env):
 
         self.M_tot = self.M + 1.5 * self.m
 
-        # Nghiêng ban đầu rất nhỏ ([-1.2°, +1.2°]) để AI bắt đầu dễ dàng
-        init_theta = np.random.uniform(-math.radians(1.2), math.radians(1.2))
+        # Khởi tạo góc ban đầu nhẹ [-1.0°, +1.0°]
+        init_theta = np.random.uniform(-math.radians(1.0), math.radians(1.0))
         init_x = np.random.uniform(-0.005, 0.005)
         self.state = np.array([init_theta, 0.0, init_x, 0.0], dtype=np.float32)
         self.prev_state = self.state.copy()
@@ -193,7 +193,7 @@ class SelfBalancingGymEnv(gym.Env):
 
         return np.array([dtheta, ddtheta, v, a], dtype=np.float32)
 
-    def step(self, action):
+    def step(self, action, disturbance=0.0):
         self.step_count += 1
 
         if self.action_mode == 'discrete':
@@ -211,34 +211,33 @@ class SelfBalancingGymEnv(gym.Env):
         applied_pwm = self.latency_buffer.pop(0)
 
         # Midpoint RK2
-        k1 = self._dynamics(self.state, applied_pwm)
+        k1 = self._dynamics(self.state, applied_pwm, disturbance)
         state_mid = self.state + 0.5 * self.Ts * k1
-        k2 = self._dynamics(state_mid, applied_pwm)
+        k2 = self._dynamics(state_mid, applied_pwm, disturbance)
 
         self.prev_state = self.state.copy()
         self.state = self.state + self.Ts * k2
 
         theta, dtheta, x, v = self.state
 
-        # Điều kiện ngã xe (Siết chặt 12 độ)
+        # Ngắt ván nếu góc nghiêng quá 15 độ
         is_fallen = abs(theta) > self.fall_angle
         is_out_of_bounds = abs(x) > self.pos_limit
         terminated = bool(is_fallen or is_out_of_bounds)
         truncated = bool(self.step_count >= self.max_steps)
 
-        # HÀM THƯỞNG CHỐNG HACK ĐIỂM CHẠY LÙI:
+        # HÀM THƯỞNG TRIỆT TIÊU HOÀN TOÀN DAO ĐỘNG CON LẮC VÕNG
         action_diff = action_val - self.prev_action
         dx = x - self.target_x
 
-        # CHỈ THƯỞNG SỐNG SÓT KHI XE THẬT SỰ THẲNG ĐỨNG (|theta| < 6 độ)
-        # Nếu xe đang nghiêng ngã (> 6 độ), lập tức cắt thưởng sống sót!
+        # Chỉ thưởng khi góc đứng thẳng an toàn (|theta| < 6 độ)
         alive_reward = self.r_alive if abs(theta) < math.radians(6.0) else 0.0
 
         reward = (alive_reward
                   - self.w_theta * (theta ** 2)
-                  - self.w_dtheta * (dtheta ** 2)
-                  - self.w_pos * (dx ** 2)
-                  - self.w_vel * (v ** 2)            # Phạt nặng vận tốc chạy tháo lui
+                  - self.w_dtheta * (dtheta ** 2)     # Dập tắt lắc lư hình sin
+                  - self.w_pos * (dx ** 2)           # Trọng số nhẹ, không gây quá trớn
+                  - self.w_vel * (v ** 2)            # Triệt tiêu vận tốc vung lắc
                   - self.w_action * (action_val ** 2)
                   - self.w_action_diff * (action_diff ** 2))
 

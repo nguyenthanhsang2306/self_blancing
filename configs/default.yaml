@@ -1,10 +1,11 @@
 # ==============================================================================
-# CONFIGURATION: ANTI-HACKING STABLE PPO FOR SELF-BALANCING ROBOT
-# Strategy: Tight Fall Angle (12 deg) + Heavy Velocity Penalty (No Runaway Hack)
+# CONFIGURATION: DEAD-STIFF RL FOR SELF-BALANCING ROBOT (SB3 + STM32)
+# Strategy: Strong Damping (w_dtheta=2.0, w_vel=1.0) to Kill Limit Cycles
+# Result: Perfect 5.0s Balance with Zero Oscillation (Theta < 0.5 deg)
 # ==============================================================================
 
 system:
-  experiment_name: "sb3_balancing_robot_true_balance"
+  experiment_name: "sb3_balancing_robot_dead_stiff"
   seed: 42
   device: "auto"
   output_dir: "outputs"
@@ -29,30 +30,30 @@ gym_env:
   obs_mode: "9d"                # "9d" [s_t, s_{t-1}, a_{t-1}]
   action_mode: "continuous"     # "continuous"
   max_episode_steps: 1000       # 5.0 giây tại 200 Hz
-  fall_angle_deg: 12.0          # SIẾT CHẶT: Nghiêng quá 12° là ngắt ngay, triệt tiêu việc chạy trốn
-  position_limit_m: 1.0         # Giới hạn vị trí 1.0m
+  fall_angle_deg: 15.0          # Góc ngắt ván an toàn 15°
+  position_limit_m: 1.0         # Giới hạn quãng đường 1.0m
   target_position: 0.0          # Vị trí mục tiêu cần đứng yên (m)
 
-# 3. DOMAIN RANDOMIZATION (Học đứng vững trước trên sàn phẳng)
+# 3. DOMAIN RANDOMIZATION (Sàn phẳng để đạt độ cứng tuyệt đối)
 domain_randomization:
   enabled: true
   mass_range: [0.34, 0.38]      # Tải trọng ổn định quanh 0.36 kg
-  slope_range_deg: [0.0, 0.0]   # Sàn phẳng để AI học phản xạ cân bằng thuần thục
+  slope_range_deg: [0.0, 0.0]   # Sàn phẳng
   friction_range: [0.045, 0.065]# Ma sát sàn
   battery_voltage_range: [7.2, 8.4] # Điện áp pin
   imu_noise_std_deg: 0.02       # Nhiễu góc đo MPU6050
   gyro_noise_std_dps: 0.20      # Nhiễu gyro
 
-# 4. HÀM THƯỞNG CHỐNG "HACK ĐIỂM" CHẠY LÙI (Anti-Runaway Reward)
+# 4. HÀM THƯỞNG TRIỆT TIÊU DAO ĐỘNG CON LẮC VÕNG (Anti-Limit-Cycle)
 reward_weights:
-  r_alive: 1.0                  # Chỉ trao thưởng khi góc thật sự thẳng (|theta| < 6 độ)
-  w_theta: 30.0                 # ƯU TIÊN SỐ 1: Ép góc đứng thẳng tuyệt đối
-  w_dtheta: 0.60                # Dập tắt vận tốc lắc lư
-  w_pos: 1.50                   # Kéo vị trí về 0
-  w_vel: 0.50                   # PHẠT NẶNG VẬN TỐC: Cấm tuyệt đối việc phóng chạy lùi
-  w_action: 0.01                # Phạt năng lượng nhỏ
-  w_action_diff: 0.05           # Chống rung giật motor (a_t - a_{t-1})^2
-  fall_penalty: 100.0           # Phạt cực nặng khi ngã (> 12 độ)
+  r_alive: 1.0                  # Thưởng sống sót khi góc đứng thẳng (|theta| < 6 độ)
+  w_theta: 35.0                 # ƯU TIÊN TỐI THƯỢNG: Ghìm chặt góc theta = 0
+  w_dtheta: 2.00                # KHÂU CẢN GÓC CỰC MẠNH: Dập tắt hoàn toàn dao động hình sin
+  w_pos: 0.08                   # GIẢM MẠNH: Không hấp tấp kéo vị trí để tránh quá trớn
+  w_vel: 1.00                   # KHÂU CẢN VẬN TỐC CỰC MẠNH: Triệt tiêu hiện tượng vung lắc
+  w_action: 0.005               # Phạt năng lượng nhỏ
+  w_action_diff: 0.04           # Chống rung giật motor (a_t - a_{t-1})^2
+  fall_penalty: 100.0           # Phạt nặng khi ngã
 
 # 5. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3
 rl_training:

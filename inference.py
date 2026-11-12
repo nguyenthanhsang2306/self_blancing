@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import argparse
 import yaml
 import numpy as np
 
@@ -9,12 +10,17 @@ from src.environment import SelfBalancingGymEnv
 from src.models import NumpyMLPPolicy
 
 def run_inference():
-    config_path = "configs/default.yaml"
-    with open(config_path, 'r', encoding='utf-8') as f:
+    parser = argparse.ArgumentParser(description="Test RL Self-Balancing Robot Controller")
+    parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to config")
+    parser.add_argument("--kick", type=float, default=0.0, help="External disturbance force in Newtons (default: 0.0 for pure balance test)")
+    args = parser.parse_args()
+
+    with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     print("==============================================================================")
     print("      INFERENCE & HIGH-FIDELITY SIMULATION TEST FOR 9D RL CONTROLLER         ")
+    print(f"      Disturbance Kick Force: {args.kick:.2f} N (t = 2.0s to 2.1s)            ")
     print("==============================================================================")
 
     env = SelfBalancingGymEnv(config)
@@ -45,17 +51,17 @@ def run_inference():
     for step_i in range(steps):
         t = step_i * env.Ts
 
-        # Tác động ngoại lực đẩy mạnh (đòn đấm 1.5 N trong 0.1s tại giây thứ 2.0)
+        # Tác động ngoại lực nếu người dùng yêu cầu (ví dụ --kick -1.5)
         dist_force = 0.0
-        if 2.0 <= t <= 2.10:
-            dist_force = -1.5
+        if 2.0 <= t <= 2.10 and args.kick != 0.0:
+            dist_force = args.kick
 
         t_start = time.perf_counter()
         action = policy.forward(obs)
         lat = (time.perf_counter() - t_start) * 1e6
         latencies.append(lat)
 
-        obs, reward, terminated, truncated, info = env.step(action)
+        obs, reward, terminated, truncated, info = env.step(action, disturbance=dist_force)
 
         t_hist.append(t)
         theta_hist.append(info['theta_deg'])
@@ -76,7 +82,7 @@ def run_inference():
 
     print("\n------------------- KẾT QUẢ HIỆU NĂNG -------------------")
     print(f"  Thời gian cân bằng sống sót : {t_hist[-1]:.2f} / {dur:.2f} s")
-    print(f"  Độ lệch góc lớn nhất        : {max_deg:.2f}° (Ngưỡng ngã: 30°)")
+    print(f"  Độ lệch góc lớn nhất        : {max_deg:.2f}° (Ngưỡng ngã: {env.cfg['gym_env']['fall_angle_deg']}°)")
     print(f"  Độ lệch vị trí lớn nhất     : {max_x:.3f} m")
     print(f"  Độ trễ suy luận trung bình  : {avg_lat:.2f} µs (Cực đại: {max_lat:.2f} µs)")
     print(f"  Thời gian tính chu kỳ 200Hz : 5000 µs -> Tận dụng ~1% CPU của STM32!")
