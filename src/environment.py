@@ -1,198 +1,222 @@
-import numpy as np
 import math
+import numpy as np
 
-class SelfBalancingRobotEnv:
+# Thử import gymnasium, nếu chưa cài thì fallback lớp Env cơ bản
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+    HAS_GYMNASIUM = True
+except ImportError:
+    HAS_GYMNASIUM = False
+    class gym:
+        class Env:
+            pass
+    class spaces:
+        class Box:
+            def __init__(self, low, high, shape=None, dtype=np.float32):
+                self.low = np.array(low, dtype=dtype)
+                self.high = np.array(high, dtype=dtype)
+                self.shape = shape if shape is not None else self.low.shape
+                self.dtype = dtype
+        class Discrete:
+            def __init__(self, n):
+                self.n = n
+
+class SelfBalancingGymEnv(gym.Env):
     """
-    High-fidelity non-linear simulation environment for two-wheeled balancing robot.
-    Includes:
-      - 4D state space: [theta (rad), dtheta (rad/s), x (m), v (m/s)]
-      - Runge-Kutta 2 (Midpoint) numerical integrator
-      - Sensor-to-motor actuation latency buffer (5 ms delay)
-      - Non-linear deadband ramp modeling static friction & stiction
-      - History observation buffer for temporal awareness
-      - Domain Randomization (Sim-to-Real transfer robustness)
+    Môi trường Gymnasium chuẩn cho Robot 2 bánh tự cân bằng:
+    Tuân thủ đúng 6 bước trong hướng dẫn RL:
+      1. Mô phỏng động lực học phi tuyến (Midpoint RK2, chu kỳ Ts = 5ms / 200 Hz).
+      2. Observation Space: Vector 4D [theta (rad), dtheta (rad/s), x (m), v (m/s)].
+      3. Action Space:
+         - Liên tục (PPO): tau / PWM chuẩn hóa trong [-1.0, 1.0].
+         - Rời rạc (DQN): 7 mức lực mượt [-1.0, -0.3, -0.1, 0.0, 0.1, 0.3, 1.0].
+      4. Reward Shaping: Thưởng tồn tại, phạt góc nghiêng, phạt giật động cơ và phạt trôi vị trí.
     """
-    def __init__(self, config):
+    metadata = {"render_modes": ["human"], "render_fps": 200}
+
+    def __init__(self, config=None):
+        super().__init__()
+
+        # Cấu hình mặc định nếu không truyền vào
+        if config is None:
+            config = {
+                'robot_physics': {
+                    'M': 0.360, 'm': 0.030, 'l': 0.031, 'r': 0.020,
+                    'J': 0.00072, 'b': 0.050, 'Km': 0.28, 'V_bat': 7.4,
+                    'deadband': 80.0, 'Ts': 0.005, 'max_pwm': 999.0, 'latency_steps': 1
+                },
+                'gym_env': {
+                    'action_mode': 'continuous',
+                    'discrete_actions': [-1.0, -0.3, -0.1, 0.0, 0.1, 0.3, 1.0],
+                    'max_episode_steps': 1000,
+                    'fall_angle_deg': 30.0,
+                    'position_limit_m': 1.5,
+                    'target_position': 0.0
+                },
+                'reward_weights': {
+                    'survival': 1.0,
+                    'w_theta': 12.0,
+                    'w_dtheta': 0.15,
+                    'w_action_diff': 0.10,
+                    'w_pos': 2.5,
+                    'fall_penalty': 50.0
+                }
+            }
+
         self.cfg = config
         p = config['robot_physics']
-        self.M_nom = p['M']
-        self.m_nom = p['m']
-        self.l_nom = p['l']
-        self.r = p['r']
-        self.J_nom = p['J']
-        self.b_nom = p['b']
-        self.Km = p['Km']
-        self.V_bat_nom = p['V_bat']
-        self.deadband = p['deadband']
-        self.Ts = p['Ts']
-        self.max_pwm = p['max_pwm']
+        self.M = p['M']               # Khối lượng thân xe (kg)
+        self.m = p['m']               # Khối lượng bánh xe (kg)
+        self.l = p['l']               # Khoảng cách từ trục bánh đến CoG (m)
+        self.r = p['r']               # Bán kính bánh xe (m)
+        self.J = p['J']               # Quán tính thân xe (kg*m^2)
+        self.b = p['b']               # Hệ số ma sát cản (N*s/m)
+        self.Km = p['Km']             # Hệ số mô-men động cơ GA12-N20
+        self.V_bat = p['V_bat']       # Điện áp pin (V)
+        self.deadband = p['deadband'] # Vùng chết động cơ
+        self.Ts = p['Ts']             # 0.005s (200 Hz)
+        self.max_pwm = p['max_pwm']   # 999
         self.g = 9.81
+        self.M_tot = self.M + 1.5 * self.m
 
-        rl_hp = config.get('rl_hyperparameters', {})
-        self.history_len = rl_hp.get('history_len', 3)
-        self.obs_dim = rl_hp.get('input_dim', 10)
+        env_cfg = config.get('gym_env', {})
+        self.action_mode = env_cfg.get('action_mode', 'continuous')
+        self.discrete_levels = np.array(env_cfg.get('discrete_actions', [-1.0, -0.3, -0.1, 0.0, 0.1, 0.3, 1.0]), dtype=np.float32)
+        self.max_steps = env_cfg.get('max_episode_steps', 1000)
+        self.fall_angle = math.radians(env_cfg.get('fall_angle_deg', 30.0))
+        self.pos_limit = env_cfg.get('position_limit_m', 1.5)
+        self.target_x = env_cfg.get('target_position', 0.0)
 
-        self.reset()
+        rw = config.get('reward_weights', {})
+        self.w_survival = rw.get('survival', 1.0)
+        self.w_theta = rw.get('w_theta', 12.0)
+        self.w_dtheta = rw.get('w_dtheta', 0.15)
+        self.w_action_diff = rw.get('w_action_diff', 0.10)
+        self.w_pos = rw.get('w_pos', 2.5)
+        self.fall_penalty = rw.get('fall_penalty', 50.0)
 
-    def reset(self, domain_randomize=False):
-        """Reset state and history buffer with optional parameter randomization."""
-        dr = self.cfg['environment']['domain_randomization']
-        if domain_randomize and dr['enabled']:
-            m_jitter = 1.0 + np.random.uniform(-dr['mass_variation'], dr['mass_variation'])
-            f_jitter = 1.0 + np.random.uniform(-dr['friction_variation'], dr['friction_variation'])
-            v_sag = 1.0 - np.random.uniform(0.0, dr['battery_sag_pct'])
-            self.M = self.M_nom * m_jitter
-            self.b = self.b_nom * f_jitter
-            self.V_bat = self.V_bat_nom * v_sag
-            self.J = self.J_nom * m_jitter
+        # 2. Định nghĩa Observation Space: [theta, dtheta, x, v]
+        high_obs = np.array([self.fall_angle * 1.2, 15.0, self.pos_limit * 1.2, 10.0], dtype=np.float32)
+        self.observation_space = spaces.Box(low=-high_obs, high=high_obs, dtype=np.float32)
+
+        # 3. Định nghĩa Action Space
+        if self.action_mode == 'discrete':
+            self.action_space = spaces.Discrete(len(self.discrete_levels))
         else:
-            self.M = self.M_nom
-            self.b = self.b_nom
-            self.V_bat = self.V_bat_nom
-            self.J = self.J_nom
+            self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
-        self.M_tot = self.M + 1.5 * self.m_nom
+        # Trạng thái nội tại
+        self.state = np.zeros(4, dtype=np.float32)
+        self.prev_action = 0.0
+        self.step_count = 0
+        self.latency_buffer = [0.0] * max(1, p.get('latency_steps', 1))
 
-        # Initial conditions: default tilt in rad
-        init_tilt = math.radians(self.cfg['environment']['initial_tilt_deg'])
-        # Add slight initial randomness
-        if domain_randomize:
-            init_tilt += math.radians(np.random.uniform(-1.5, 1.5))
+    def reset(self, seed=None, options=None):
+        """Khởi tạo lại trạng thái ban đầu của Robot với độ nhiễu nhỏ."""
+        if seed is not None:
+            np.random.seed(seed)
 
-        self.state = np.array([init_tilt, 0.0, 0.0, 0.0], dtype=np.float64)
-        self.time = 0.0
+        # Nghiêng ngẫu nhiên nhẹ ban đầu trong khoảng [-4°, +4°]
+        init_theta = np.random.uniform(-math.radians(4.0), math.radians(4.0))
+        init_x = np.random.uniform(-0.02, 0.02)
+        self.state = np.array([init_theta, 0.0, init_x, 0.0], dtype=np.float32)
 
-        # Delay buffer for hardware latency (1 step = 5ms)
-        self.actuation_delay_buffer = [0.0] * max(1, self.cfg['robot_physics']['latency_steps'])
-        self.last_applied_pwm = 0.0
+        self.prev_action = 0.0
+        self.step_count = 0
+        self.latency_buffer = [0.0] * len(self.latency_buffer)
 
-        # History buffers for temporal observation [s_t, u_{t-1}, delta_s_t, u_{t-2}]
-        self.prev_state = self.state.copy()
-        self.u_history = [0.0, 0.0]
+        return self.state.copy(), {}
 
-        return self.get_observation()
-
-    def _apply_deadband(self, u_cmd):
-        """Simulate real hardware motor stiction and PWM deadband."""
-        mag = abs(u_cmd)
+    def _apply_deadband(self, u_pwm):
+        """Mô phỏng vùng chết và ma sát tĩnh của động cơ GA12-N20."""
+        mag = abs(u_pwm)
         if mag < self.deadband:
             return 0.0
-        # Smooth linear ramp past deadband
-        effective_pwm = math.copysign((mag - self.deadband) * (self.max_pwm / (self.max_pwm - self.deadband)), u_cmd)
+        effective_pwm = math.copysign((mag - self.deadband) * (self.max_pwm / (self.max_pwm - self.deadband)), u_pwm)
         return float(np.clip(effective_pwm, -self.max_pwm, self.max_pwm))
 
-    def _dynamics(self, s, u_pwm, disturbance_force=0.0):
-        """
-        Compute non-linear equations of motion:
-        s = [theta, dtheta, x, v]
-        Returns: [dtheta, ddtheta, v, a]
-        """
+    def _dynamics(self, s, u_pwm, disturbance=0.0):
+        """Phương trình động lực học vi phân phi tuyến của xe tự cân bằng."""
         theta, dtheta, x, v = s
 
-        # Motor tractive force on ground (parameters.m & GA12-N20 specs)
         effective_pwm = self._apply_deadband(u_pwm)
         F_motor = (self.Km * (self.V_bat / self.max_pwm)) * effective_pwm
 
         cos_t = math.cos(theta)
         sin_t = math.sin(theta)
 
-        den = self.M_tot * (self.J + self.M * (self.l_nom**2)) - (self.M * self.l_nom * cos_t)**2
+        den = self.M_tot * (self.J + self.M * (self.l**2)) - (self.M * self.l * cos_t)**2
         if abs(den) < 1e-7:
             den = 1e-7
 
-        # Coulomb & viscous friction + centripetal forces
-        f_c = 0.02 * math.tanh(v * 20.0)
-        F_n = F_motor - self.b * v - f_c + self.M * self.l_nom * (dtheta**2) * sin_t
-        tau = self.M * self.g * self.l_nom * sin_t + disturbance_force * self.l_nom * cos_t
+        f_coulomb = 0.02 * math.tanh(v * 20.0)
+        F_net = F_motor - self.b * v - f_coulomb + self.M * self.l * (dtheta**2) * sin_t
+        tau = self.M * self.g * self.l * sin_t + disturbance * self.l * cos_t
 
-        # Non-linear coupled accelerations
-        a = ((self.J + self.M * (self.l_nom**2)) * F_n - (self.M * self.l_nom * cos_t) * tau) / den
-        ddtheta = (self.M_tot * tau - (self.M * self.l_nom * cos_t) * F_n) / den
+        a = ((self.J + self.M * (self.l**2)) * F_net - (self.M * self.l * cos_t) * tau) / den
+        ddtheta = (self.M_tot * tau - (self.M * self.l * cos_t) * F_net) / den
 
-        return np.array([dtheta, ddtheta, v, a], dtype=np.float64)
+        return np.array([dtheta, ddtheta, v, a], dtype=np.float32)
 
-    def step(self, u_cmd, disturbance_force=0.0):
+    def step(self, action):
         """
-        Execute one control cycle (Ts = 0.005s) using Runge-Kutta 2 (Midpoint).
+        Thực hiện một bước điều khiển (Ts = 5 ms):
+          - Quy đổi hành động về PWM [-999, +999].
+          - Tích phân Runge-Kutta 2 (Midpoint).
+          - Tính hàm thưởng kết hợp chống giật rung.
         """
-        # Hardware latency delay: motor sees delayed command
-        self.actuation_delay_buffer.append(u_cmd)
-        applied_pwm = self.actuation_delay_buffer.pop(0)
-        self.last_applied_pwm = applied_pwm
+        self.step_count += 1
 
-        # Midpoint RK2 integration
-        k1 = self._dynamics(self.state, applied_pwm, disturbance_force)
+        # Chuyển đổi hành động sang giá trị float trong [-1.0, 1.0]
+        if self.action_mode == 'discrete':
+            act_idx = int(action)
+            action_val = float(self.discrete_levels[act_idx])
+        else:
+            if isinstance(action, (np.ndarray, list)):
+                action_val = float(action[0])
+            else:
+                action_val = float(action)
+            action_val = float(np.clip(action_val, -1.0, 1.0))
+
+        # Mô phỏng trễ phần cứng (1 chu kỳ = 5 ms)
+        self.latency_buffer.append(action_val * self.max_pwm)
+        applied_pwm = self.latency_buffer.pop(0)
+
+        # Tích phân Midpoint RK2
+        k1 = self._dynamics(self.state, applied_pwm)
         state_mid = self.state + 0.5 * self.Ts * k1
-        k2 = self._dynamics(state_mid, applied_pwm, disturbance_force)
+        k2 = self._dynamics(state_mid, applied_pwm)
+        self.state = self.state + self.Ts * k2
 
-        self.prev_state = self.state.copy()
-        self.state += self.Ts * k2
-        self.time += self.Ts
+        theta, dtheta, x, v = self.state
 
-        # Update action history
-        self.u_history.append(u_cmd)
-        if len(self.u_history) > 2:
-            self.u_history.pop(0)
+        # Kiểm tra điều kiện ngã hoặc vượt giới hạn (Terminal condition)
+        is_fallen = abs(theta) > self.fall_angle
+        is_out_of_bounds = abs(x) > self.pos_limit
+        terminated = bool(is_fallen or is_out_of_bounds)
+        truncated = bool(self.step_count >= self.max_steps)
 
-        # Observation
-        obs = self.get_observation()
+        # 4. THIẾT KẾ HÀM THƯỞNG (Reward Shaping)
+        # R = +1 (tồn tại) - w1*theta^2 - w2*dtheta^2 - w3*(a_t - a_{t-1})^2 - w4*(x - x_target)^2
+        action_diff = action_val - self.prev_action
+        reward = (self.w_survival
+                  - self.w_theta * (theta ** 2)
+                  - self.w_dtheta * (dtheta ** 2)
+                  - self.w_action_diff * (action_diff ** 2)
+                  - self.w_pos * ((x - self.target_x) ** 2))
 
-        # Reward formulation for balance and zero position drift
-        theta_deg = math.degrees(self.state[0])
-        dtheta_deg = math.degrees(self.state[1])
-        x_m = self.state[2]
-        v_m = self.state[3]
+        # Phạt nặng khi bị ngã xe
+        if terminated:
+            reward -= self.fall_penalty
 
-        # Penalties: quadratic tilt, angular velocity, position drift, and motor effort
-        r_angle = -1.0 * (theta_deg ** 2) - 0.05 * (dtheta_deg ** 2)
-        r_pos = -15.0 * (x_m ** 2) - 2.0 * (v_m ** 2)
-        r_effort = -0.0001 * (u_cmd ** 2)
-        reward = r_angle + r_pos + r_effort
+        self.prev_action = action_val
 
-        # Failure condition
-        done = abs(theta_deg) > 40.0
-
-        return obs, reward, done, {
-            "theta_deg": theta_deg,
-            "dtheta_deg": dtheta_deg,
-            "x_m": x_m,
-            "v_m": v_m,
-            "applied_pwm": applied_pwm
+        info = {
+            "theta_deg": math.degrees(theta),
+            "x_pos": x,
+            "applied_pwm": applied_pwm,
+            "step": self.step_count
         }
 
-    def get_observation(self):
-        """
-        Generate 10D History-Aware observation vector:
-        [theta_deg, dtheta_deg, x_m, v_m, u_{t-1}, delta_theta, delta_dtheta, delta_x, delta_v, u_{t-2}]
-        """
-        curr = np.array([
-            math.degrees(self.state[0]),
-            math.degrees(self.state[1]),
-            self.state[2],
-            self.state[3]
-        ], dtype=np.float64)
-
-        prev = np.array([
-            math.degrees(self.prev_state[0]),
-            math.degrees(self.prev_state[1]),
-            self.prev_state[2],
-            self.prev_state[3]
-        ], dtype=np.float64)
-
-        delta = curr - prev
-
-        obs = np.array([
-            curr[0] / 30.0,         # Normalized theta (+/- 30 deg -> +/- 1.0)
-            curr[1] / 150.0,        # Normalized dtheta (+/- 150 deg/s)
-            curr[2] / 0.5,          # Normalized x (+/- 0.5 m)
-            curr[3] / 1.5,          # Normalized v (+/- 1.5 m/s)
-            self.u_history[-1] / 999.0, # u_{t-1}
-            delta[0] / 5.0,         # delta theta
-            delta[1] / 20.0,        # delta dtheta
-            delta[2] / 0.05,        # delta x
-            delta[3] / 0.1,         # delta v
-            self.u_history[-2] / 999.0  # u_{t-2}
-        ], dtype=np.float32)
-
-        return obs
-
+        return self.state.copy(), float(reward), terminated, truncated, info

@@ -37,8 +37,8 @@ typedef struct {
     float last_u;  /* Previous control output (PWM) */
 } ADRC_State_t;
 
-static inline void ADRC_Init(ADRC_State_t *adrc) {
-    adrc->z1 = 0.0f;
+static inline void ADRC_Init(ADRC_State_t *adrc, float init_theta) {
+    adrc->z1 = init_theta;
     adrc->z2 = 0.0f;
     adrc->z3 = 0.0f;
     adrc->last_u = 0.0f;

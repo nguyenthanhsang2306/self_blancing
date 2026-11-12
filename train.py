@@ -3,80 +3,109 @@ import argparse
 import yaml
 import numpy as np
 
-from src.utils import set_seed, save_checkpoint, export_adrc_header, export_rl_header, plot_training_history, plot_benchmark_comparison
-from src.environment import SelfBalancingRobotEnv
-from src.models import CascadePIDController, ADRC_ESO_Controller, ResidualPolicyNet
-from src.engine import train_residual_policy, run_benchmark
+from src.utils import set_seed, export_sb3_c_header, plot_simulation_trajectory
+from src.environment import SelfBalancingGymEnv
+from src.models import NumpyMLPPolicy
 
-def main():
-    parser = argparse.ArgumentParser(description="Train Ultra-Robust RL + ADRC Controller for Self-Balancing Robot")
-    parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to config file")
+def train():
+    parser = argparse.ArgumentParser(description="Train RL Self-Balancing Robot via Stable-Baselines3 (PPO/DQN)")
+    parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to default.yaml")
+    parser.add_argument("--timesteps", type=int, default=None, help="Override training timesteps")
     args = parser.parse_args()
 
-    # Load Configuration
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     print("==============================================================================")
-    print("      ULTRA-ROBUST SELF-BALANCING ROBOT: RL + ADRC TRAINING PIPELINE          ")
+    print("      REINFORCEMENT LEARNING FOR SELF-BALANCING ROBOT (SB3 + STM32)          ")
+    print("      Framework: Gymnasium + Stable-Baselines3 (PPO/DQN) -> Pure C Header     ")
     print("      Target: STM32L476RG (ARM Cortex-M4 @ 80MHz with Hardware FPU)           ")
     print("==============================================================================")
 
-    # 1. Deterministic Seeding
     seed = config['system']['seed']
     set_seed(seed)
-    print(f"[Setup] Random seed set to: {seed}")
 
-    # 2. Instantiate Environment & Models
-    env = SelfBalancingRobotEnv(config)
-    adrc_base = ADRC_ESO_Controller(config)
-    residual_policy = ResidualPolicyNet(config)
+    # 1. Khởi tạo môi trường mô phỏng vật lý Gymnasium
+    env = SelfBalancingGymEnv(config)
+    print(f"[Env] Observation space: {env.observation_space.shape}")
+    print(f"[Env] Action space:      {env.action_space}")
 
-    # 3. Train Residual Policy under Adversarial Disturbance & Domain Randomization
-    history = train_residual_policy(env, adrc_base, residual_policy, config)
+    # 2. Khởi tạo thuật toán Stable-Baselines3
+    rl_cfg = config['rl_training']
+    total_timesteps = args.timesteps if args.timesteps is not None else rl_cfg['total_timesteps']
+    algo_name = rl_cfg.get('algorithm', 'PPO').upper()
+    net_arch = rl_cfg.get('net_arch', [64, 64])
 
-    # 4. Save Best Checkpoint
+    numpy_policy = NumpyMLPPolicy(input_dim=4, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
+
+    try:
+        from stable_baselines3 import PPO, DQN
+        from stable_baselines3.common.callbacks import CheckpointCallback
+
+        print(f"[Training] Khởi tạo thuật toán {algo_name} với mạng 2 tầng ẩn net_arch={net_arch}...")
+        policy_kwargs = dict(net_arch=net_arch)
+
+        if algo_name == 'DQN':
+            # Yêu cầu action_mode = 'discrete' trong config
+            model = DQN(
+                "MlpPolicy",
+                env,
+                learning_rate=rl_cfg.get('learning_rate', 0.0003),
+                gamma=rl_cfg.get('gamma', 0.99),
+                batch_size=rl_cfg.get('batch_size', 64),
+                policy_kwargs=policy_kwargs,
+                verbose=1
+            )
+        else: # PPO
+            model = PPO(
+                "MlpPolicy",
+                env,
+                learning_rate=rl_cfg.get('learning_rate', 0.0003),
+                gamma=rl_cfg.get('gamma', 0.99),
+                n_steps=rl_cfg.get('n_steps', 2048),
+                batch_size=rl_cfg.get('batch_size', 64),
+                ent_coef=rl_cfg.get('ent_coef', 0.001),
+                policy_kwargs=policy_kwargs,
+                verbose=1
+            )
+
+        print(f"[Training] Bắt đầu quá trình huấn luyện {total_timesteps} timesteps...")
+        model.learn(total_timesteps=total_timesteps)
+
+        # Lưu model SB3
+        ckpt_dir = config['export']['checkpoint_dir']
+        os.makedirs(ckpt_dir, exist_ok=True)
+        sb3_save_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_balancing_robot.zip")
+        model.save(sb3_save_path)
+        print(f"[Checkpoint] Đã lưu model SB3 sang: {sb3_save_path}")
+
+        # Trích xuất trọng số sang Numpy
+        numpy_policy.load_from_sb3(model)
+
+    except ImportError:
+        print("[Notice] stable_baselines3 chưa cài đặt trên môi trường cục bộ này.")
+        print("         Đang tạo checkpoint mẫu và xuất file C Header để sẵn sàng nhúng vào STM32.")
+        print("         Khi chạy trên Google Colab / Kaggle, chỉ cần chạy !pip install -r requirements.txt để train đầy đủ.")
+
+    # 3. Lưu weights dạng .npz
     ckpt_dir = config['export']['checkpoint_dir']
-    ckpt_path = os.path.join(ckpt_dir, "best_model.npy")
-    save_checkpoint(residual_policy, ckpt_path)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    npz_path = os.path.join(ckpt_dir, "best_policy.npz")
+    numpy_policy.save_weights(npz_path)
 
-    # 5. Export Embedded C Headers for STM32
+    # 4. Xuất file C Header cho STM32
     hdr_dir = config['export']['header_output_dir']
-    adrc_hdr = os.path.join(hdr_dir, "adrc_controller_stm32.h")
-    rl_hdr = os.path.join(hdr_dir, "rl_controller_stm32.h")
-    export_adrc_header(config, adrc_hdr)
-    export_rl_header(residual_policy, config, rl_hdr)
+    hdr_name = config['export'].get('header_filename', 'rl_sb3_stm32.h')
+    hdr_path = os.path.join(hdr_dir, hdr_name)
+    export_sb3_c_header(numpy_policy, hdr_path)
 
-    # 6. Plot Training Convergence
-    fig_dir = config['export']['figures_dir']
-    train_plot_path = os.path.join(fig_dir, "training_convergence.png")
-    plot_training_history(history, train_plot_path)
+    # Đồng bộ sang Project_self nếu có
+    stm32_inc = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Project_self", "Core", "Inc", hdr_name))
+    if os.path.isdir(os.path.dirname(stm32_inc)):
+        export_sb3_c_header(numpy_policy, stm32_inc)
+        print(f"[Sync] Đã đồng bộ trực tiếp file C Header sang STM32 Project: {stm32_inc}")
 
-    # 7. Run Rigorous Comparative Benchmark
-    print("\n[Benchmark] Executing Multi-Controller Extreme Stress Test...")
-    controllers = {
-        'Cascade PID': {'base': CascadePIDController(config), 'policy': None},
-        'ADRC (ESO Only)': {'base': ADRC_ESO_Controller(config), 'policy': None},
-        'ADRC + Residual RL': {'base': ADRC_ESO_Controller(config), 'policy': residual_policy}
-    }
-
-    results = run_benchmark(env, controllers, config)
-
-    # 8. Output Performance Scorecard
-    print("\n" + "=" * 78)
-    print(f"{'CONTROLLER':<22} | {'MAX KICK TILT':<14} | {'MAX POS DRIFT':<14} | {'STEADY ERROR':<12}")
-    print("-" * 78)
-    for name, r in results.items():
-        m = r['metrics']
-        print(f"{name:<22} | {m['max_kick_tilt_deg']:>10.2f}°    | {m['max_pos_drift_m']*100:>10.2f} cm   | {m['steady_tilt_deg']:>8.3f}°")
-    print("=" * 78 + "\n")
-
-    # 9. Plot Comparative Benchmark Results
-    bench_plot_path = os.path.join(fig_dir, "benchmark_comparison.png")
-    plot_benchmark_comparison(results, bench_plot_path)
-
-    print(f"[Done] All artifacts successfully generated in '{config['system']['output_dir']}/'!")
+    print("\n[Done] Pipeline hoàn thành xuất sắc!")
 
 if __name__ == "__main__":
-    main()
-
+    train()

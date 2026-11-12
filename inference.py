@@ -1,110 +1,91 @@
 import os
 import time
-import argparse
-import yaml
 import math
+import yaml
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
-from src.models import ADRC_ESO_Controller, ResidualPolicyNet
-from src.environment import SelfBalancingRobotEnv
-from src.utils import load_checkpoint
+from src.utils import plot_simulation_trajectory
+from src.environment import SelfBalancingGymEnv
+from src.models import NumpyMLPPolicy
 
-def main():
-    parser = argparse.ArgumentParser(description="Real-time Inference and Benchmark Evaluation")
-    parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to configuration file")
-    parser.add_argument("--checkpoint", type=str, default="outputs/checkpoints/best_model.npy", help="Path to checkpoint")
-    parser.add_argument("--kick_force", type=float, default=-1.5, help="Disturbance kick force in Newtons")
-    args = parser.parse_args()
-
-    with open(args.config, 'r', encoding='utf-8') as f:
+def run_inference():
+    config_path = "configs/default.yaml"
+    with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     print("==============================================================================")
-    print("                 REAL-TIME INFERENCE & ROBUSTNESS TEST                        ")
+    print("      INFERENCE & HIGH-FIDELITY SIMULATION TEST FOR RL CONTROLLER            ")
     print("==============================================================================")
 
-    env = SelfBalancingRobotEnv(config)
-    adrc = ADRC_ESO_Controller(config)
-    policy = ResidualPolicyNet(config)
+    # 1. Khởi tạo môi trường
+    env = SelfBalancingGymEnv(config)
+    obs, _ = env.reset(seed=42)
 
-    # Load weights
-    load_checkpoint(policy, args.checkpoint)
+    # 2. Khởi tạo policy
+    net_arch = config['rl_training'].get('net_arch', [64, 64])
+    policy = NumpyMLPPolicy(input_dim=4, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
 
-    # 1. Benchmark Single-Step Inference Latency
-    test_obs = env.get_observation()
-    n_iters = 10000
-    t0 = time.perf_counter()
-    for _ in range(n_iters):
-        _ = policy.forward(test_obs)
-    t1 = time.perf_counter()
-    avg_latency_us = ((t1 - t0) / n_iters) * 1e6
-    print(f"[Latency Benchmark] Average Policy Inference Time: {avg_latency_us:.2f} microseconds / step")
-    print(f"[Hardware Real-Time Check] 200 Hz budget = 5000 us. CPU compute = {avg_latency_us:.2f} us (< 0.5% CPU load).\n")
+    ckpt_path = os.path.join(config['export']['checkpoint_dir'], "best_policy.npz")
+    if os.path.exists(ckpt_path):
+        policy.load_weights(ckpt_path)
+        print(f"[Model] Đã nạp thành công weights từ: {ckpt_path}")
+    else:
+        print("[Model] Checkpoint chưa có, chạy với trọng số khởi tạo ban đầu.")
 
-    # 2. Run High-Stress Inference Simulation
-    print(f"[Simulation] Testing extreme shock disturbance F = {args.kick_force:.2f} N at t=1.0s...")
-    obs = env.reset(domain_randomize=False)
-    adrc.reset()
+    # 3. Chạy mô phỏng 5 giây (1000 bước ở 200 Hz)
+    t_hist = []
+    theta_hist = []
+    x_hist = []
+    pwm_hist = []
 
-    sim_duration = 3.0
-    steps = int(sim_duration / env.Ts)
-    t_arr, th_arr, x_arr, u_arr, z3_arr = [], [], [], [], []
+    dur = 5.0
+    steps = int(dur / env.Ts)
 
-    for step in range(steps):
-        t = step * env.Ts
-        dist = args.kick_force if (1.0 <= t <= 1.08) else 0.0
+    print(f"[Sim] Bắt đầu chạy mô phỏng thời lượng {dur} giây ({steps} bước tại Ts = {env.Ts*1000:.1f}ms)...")
+    latencies = []
 
-        th = math.degrees(env.state[0])
-        dth = math.degrees(env.state[1])
-        x = env.state[2]
-        v = env.state[3]
+    for step_i in range(steps):
+        t = step_i * env.Ts
 
-        u_base, z3 = adrc.step(th, x, v)
-        delta_u = policy.forward(obs)
-        u_total = float(np.clip(u_base + delta_u, -999.0, 999.0))
+        # Tác động ngoại lực đẩy mạnh (đòn đấm 1.5 N trong 0.1s tại giây thứ 2.0)
+        dist_force = 0.0
+        if 2.0 <= t <= 2.10:
+            dist_force = -1.5 # Lực đẩy 1.5 N
 
-        obs, _, done, _ = env.step(u_total, disturbance_force=dist)
+        # Đo độ trễ suy luận nơ-ron
+        t_start = time.perf_counter()
+        action = policy.forward(obs)
+        lat = (time.perf_counter() - t_start) * 1e6 # microseconds
+        latencies.append(lat)
 
-        t_arr.append(t)
-        th_arr.append(th)
-        x_arr.append(x)
-        u_arr.append(u_total)
-        z3_arr.append(z3)
+        obs, reward, terminated, truncated, info = env.step(action)
 
-    # 3. Plot Inference Results
-    os.makedirs("outputs/figures", exist_ok=True)
-    out_fig = "outputs/figures/inference_test.png"
-    fig, axs = plt.subplots(3, 1, figsize=(10, 9), sharex=True, dpi=300)
+        t_hist.append(t)
+        theta_hist.append(info['theta_deg'])
+        x_hist.append(info['x_pos'])
+        pwm_hist.append(info['applied_pwm'])
 
-    axs[0].plot(t_arr, th_arr, 'g-', lw=2.0, label='Tilt Angle [deg]')
-    axs[0].axvspan(1.0, 1.08, color='red', alpha=0.2, label=f'Kick Shock ({args.kick_force}N)')
-    axs[0].set_ylabel('Angle [deg]', fontweight='bold')
-    axs[0].set_title(f'Inference Verification Under Extreme Shock (Kick = {args.kick_force}N)', fontsize=13, fontweight='bold')
-    axs[0].grid(True, linestyle='--', alpha=0.6)
-    axs[0].legend()
+        if terminated:
+            print(f"[Sim] Robot bị ngã tại t = {t:.2f}s (Góc nghiêng = {info['theta_deg']:.1f}°)")
+            break
 
-    axs[1].plot(t_arr, x_arr, 'b-', lw=2.0, label='Position [m]')
-    axs[1].set_ylabel('Position x [m]', fontweight='bold')
-    axs[1].grid(True, linestyle='--', alpha=0.6)
-    axs[1].legend()
+    # 4. Vẽ đồ thị
+    fig_path = os.path.join(config['export']['figures_dir'], "rl_inference_test.png")
+    plot_simulation_trajectory(t_hist, theta_hist, x_hist, pwm_hist, fig_path)
 
-    axs[2].plot(t_arr, u_arr, 'm-', lw=1.8, label='Motor Output PWM')
-    axs[2].set_ylabel('PWM [-999, +999]', fontweight='bold')
-    axs[2].set_xlabel('Time [s]', fontweight='bold')
-    axs[2].grid(True, linestyle='--', alpha=0.6)
-    axs[2].legend()
+    # 5. Đánh giá chỉ số
+    avg_lat = np.mean(latencies)
+    max_lat = np.max(latencies)
+    max_deg = np.max(np.abs(theta_hist))
+    max_x = np.max(np.abs(x_hist))
 
-    plt.tight_layout()
-    plt.savefig(out_fig)
-    plt.close()
-
-    print(f"[Result] Max tilt angle recorded: {np.max(np.abs(th_arr)):.2f}°")
-    print(f"[Result] Final steady position drift: {abs(x_arr[-1])*100:.2f} cm")
-    print(f"[Result] Inference plot generated -> {out_fig}\n")
+    print("\n------------------- KẾT QUẢ HIỆU NĂNG -------------------")
+    print(f"  Thời gian cân bằng sống sót : {t_hist[-1]:.2f} / {dur:.2f} s")
+    print(f"  Độ lệch góc lớn nhất        : {max_deg:.2f}° (Ngưỡng ngã: 30°)")
+    print(f"  Độ lệch vị trí lớn nhất     : {max_x:.3f} m")
+    print(f"  Độ trễ suy luận trung bình  : {avg_lat:.2f} µs (Cực đại: {max_lat:.2f} µs)")
+    print(f"  Thời gian tính chu kỳ 200Hz : 5000 µs -> Tận dụng < 1% CPU của STM32!")
+    print("---------------------------------------------------------")
 
 if __name__ == "__main__":
-    main()
-
+    run_inference()

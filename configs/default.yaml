@@ -1,67 +1,62 @@
 # ==============================================================================
-# CONFIGURATION: ULTRA-ROBUST SELF-BALANCING ROBOT (STM32L476RG + GA12-N20)
+# CONFIGURATION: REINFORCEMENT LEARNING FOR SELF-BALANCING ROBOT (SB3 + STM32)
+# Reference: 6-Step RL Standard (Gymnasium + Stable-Baselines3 + C Deployment)
 # ==============================================================================
 
 system:
-  experiment_name: "ultra_robust_rl_adrc"
+  experiment_name: "sb3_balancing_robot"
   seed: 42
-  device: "cpu"
+  device: "auto"
   output_dir: "outputs"
 
+# 1. MÔ HÌNH VẬT LÝ ROBOT (Physical Model)
 robot_physics:
-  M: 0.360            # Chassis mass (kg)
-  m: 0.030            # Single wheel mass (kg)
-  l: 0.031            # CoG distance from wheel axle (m)
-  r: 0.020            # Wheel radius (m, diameter 40mm)
-  J: 0.00072          # Moment of inertia about CoG (kg*m^2)
-  b: 0.050            # Viscous friction damping coefficient (N*s/m)
-  Km: 0.28            # GA12-N20 motor torque/voltage factor (N/V)
-  V_bat: 7.4          # 2S LiPo nominal voltage (V)
-  deadband: 80.0      # Motor deadband threshold (PWM out of 999)
-  Ts: 0.005           # Control cycle period (200 Hz on TIM6 interrupt)
-  max_pwm: 999.0      # Maximum hardware timer ARR count (TIM1 16-bit)
-  latency_steps: 1    # 1-step sensor-to-actuator hardware delay (5 ms)
+  M: 0.360            # Khối lượng thân xe (kg)
+  m: 0.030            # Khối lượng bánh xe (kg)
+  l: 0.031            # Khoảng cách từ trục bánh đến trọng tâm CoG (m)
+  r: 0.020            # Bán kính bánh xe (m, D = 40mm)
+  J: 0.00072          # Mô-men quán tính thân xe quanh trục CoG (kg*m^2)
+  b: 0.050            # Hệ số ma sát nhớt tiếp đất (N*s/m)
+  Km: 0.28            # Hệ số mô-men động cơ GA12-N20 (N/V)
+  V_bat: 7.4          # Điện áp pin 2S LiPo (V)
+  deadband: 80.0      # Vùng chết động cơ (PWM / 999)
+  Ts: 0.005           # Chu kỳ lấy mẫu 200 Hz (5 ms trên ngắt TIM6)
+  max_pwm: 999.0      # Giới hạn xung PWM cực đại (TIM1 ARR = 999)
+  latency_steps: 1    # Trễ phần cứng cảm biến - truyền động (5 ms)
 
-baseline_pid:
-  kp_angle: 55.85     # Inner balance loop proportional gain
-  kd_angle: 3.84      # Inner balance loop derivative gain
-  kp_pos: 2.005       # Outer position loop proportional gain
-  kd_pos: 3.151       # Outer position loop derivative gain
+# 2. KHÔNG GIAN TRẠNG THÁI & HÀNH ĐỘNG (Observation & Action Space)
+gym_env:
+  action_mode: "continuous"     # "continuous" (cho PPO) hoặc "discrete" (cho DQN)
+  discrete_actions: [-1.0, -0.3, -0.1, 0.0, 0.1, 0.3, 1.0] # 7 mức lực mượt cho DQN
+  max_episode_steps: 1000       # 5.0 giây tại 200 Hz
+  fall_angle_deg: 30.0          # Góc ngắt ván (ngã xe)
+  position_limit_m: 1.5         # Giới hạn quãng đường di chuyển (m)
+  target_position: 0.0          # Vị trí mục tiêu cần đứng yên (m)
 
-adrc_controller:
-  b0: 4.3135          # Nominal system control gain (deg / (s^2 * PWM))
-  omega_o: 48.0       # Observer bandwidth (rad/s) for ultra-stiff disturbance rejection
-  omega_c: 18.5       # Controller bandwidth (rad/s)
-  pos_kp: 2.005       # Outer position loop proportional gain
-  pos_kd: 3.151       # Outer position loop velocity damping
+# 3. THIẾT KẾ HÀM THƯỞNG (Reward Shaping)
+# R = survival - w1*theta^2 - w2*dtheta^2 - w3*(a_t - a_{t-1})^2 - w4*(x - x_target)^2
+reward_weights:
+  survival: 1.0                 # Thưởng tồn tại mỗi bước không bị ngã
+  w_theta: 12.0                 # Phạt độ lệch góc nghiêng
+  w_dtheta: 0.15                # Phạt vận tốc góc nghiêng
+  w_action_diff: 0.10           # Phạt rung giật / thay đổi lực đột ngột (a_t - a_{t-1})^2
+  w_pos: 2.5                    # Phạt trôi xa vị trí mục tiêu
+  fall_penalty: 50.0            # Phạt nặng khi bị ngã hoặc chạy quá giới hạn
 
-rl_hyperparameters:
-  history_len: 3      # Temporal history steps
-  input_dim: 10       # [theta, dtheta, x, v, u_last, delta_theta, delta_dtheta, delta_x, delta_v, u_prev2]
-  hidden_dims: [32, 32]
-  output_dim: 1       # Residual torque delta u
-  action_scale: 450.0 # Bounded residual action limit (+/- 450 PWM)
-  population_size: 64 # Evolutionary search population
-  num_generations: 120
-  learning_rate: 0.05
-  sigma: 0.08         # Mutation perturbation standard deviation
-  patience: 25        # Early stopping patience if no reward improvement
+# 4. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3
+rl_training:
+  algorithm: "PPO"              # "PPO" (khuyên dùng) hoặc "DQN"
+  net_arch: [64, 64]            # 2 tầng ẩn [64, 64] tối ưu để nhúng STM32
+  total_timesteps: 200000       # 200,000 bước huấn luyện
+  learning_rate: 0.0003
+  gamma: 0.99                   # Hệ số chiết khấu
+  batch_size: 64
+  n_steps: 2048                 # Số bước rollout mỗi lần cập nhật PPO
+  ent_coef: 0.001               # Entropy exploration
 
-environment:
-  sim_duration: 3.0   # Episode duration (seconds)
-  initial_tilt_deg: 10.0 # Initial disturbance angle (degrees)
-  kick_force: -1.2    # Strong external punch force (N)
-  kick_start_time: 1.0 # Timing of shock disturbance (s)
-  kick_duration: 0.08 # Duration of impulse (s)
-  domain_randomization:
-    enabled: true
-    mass_variation: 0.25      # +/- 25% payload variation
-    friction_variation: 0.30  # Floor friction variation
-    battery_sag_pct: 0.15     # Voltage sag under high current
-
+# 5. XUẤT MÔ HÌNH VÀ DEPLOY LÊN STM32
 export:
-  export_c_headers: true
-  header_output_dir: "outputs/firmware_headers"
   checkpoint_dir: "outputs/checkpoints"
   figures_dir: "outputs/figures"
-
+  header_output_dir: "outputs/firmware_headers"
+  header_filename: "rl_sb3_stm32.h"
