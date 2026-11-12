@@ -1,10 +1,10 @@
 # ==============================================================================
-# CONFIGURATION: STABLE 9D PPO FOR TWO-WHEELED SELF-BALANCING ROBOT
-# Verified Additive Reward: Angle Priority (85%) > Damping (10%) > Position (5%)
+# CONFIGURATION: ANTI-HACKING STABLE PPO FOR SELF-BALANCING ROBOT
+# Strategy: Tight Fall Angle (12 deg) + Heavy Velocity Penalty (No Runaway Hack)
 # ==============================================================================
 
 system:
-  experiment_name: "sb3_balancing_robot_stable_9d"
+  experiment_name: "sb3_balancing_robot_true_balance"
   seed: 42
   device: "auto"
   output_dir: "outputs"
@@ -29,37 +29,36 @@ gym_env:
   obs_mode: "9d"                # "9d" [s_t, s_{t-1}, a_{t-1}]
   action_mode: "continuous"     # "continuous"
   max_episode_steps: 1000       # 5.0 giây tại 200 Hz
-  fall_angle_deg: 28.0          # Góc ngắt ván (ngã xe)
-  position_limit_m: 1.5         # Giới hạn quãng đường 1.5m
+  fall_angle_deg: 12.0          # SIẾT CHẶT: Nghiêng quá 12° là ngắt ngay, triệt tiêu việc chạy trốn
+  position_limit_m: 1.0         # Giới hạn vị trí 1.0m
   target_position: 0.0          # Vị trí mục tiêu cần đứng yên (m)
 
-# 3. DOMAIN RANDOMIZATION (Sim-to-Real)
+# 3. DOMAIN RANDOMIZATION (Học đứng vững trước trên sàn phẳng)
 domain_randomization:
   enabled: true
-  mass_range: [0.32, 0.42]      # Tải trọng thay đổi thực tế
-  slope_range_deg: [-2.5, 2.5]  # Độ dốc ngẫu nhiên nhẹ để AI học vững vàng
-  friction_range: [0.04, 0.07]  # Ma sát mặt sàn
+  mass_range: [0.34, 0.38]      # Tải trọng ổn định quanh 0.36 kg
+  slope_range_deg: [0.0, 0.0]   # Sàn phẳng để AI học phản xạ cân bằng thuần thục
+  friction_range: [0.045, 0.065]# Ma sát sàn
   battery_voltage_range: [7.2, 8.4] # Điện áp pin
-  imu_noise_std_deg: 0.03       # Nhiễu góc đo MPU6050
-  gyro_noise_std_dps: 0.30      # Nhiễu con quay hồi chuyển Gyro
+  imu_noise_std_deg: 0.02       # Nhiễu góc đo MPU6050
+  gyro_noise_std_dps: 0.20      # Nhiễu gyro
 
-# 4. HÀM THƯỞNG CHUẨN CÔNG THỨC (Angle Dominant Additive Reward)
-# r_t = r_alive - w_theta*theta^2 - w_dtheta*dtheta^2 - w_pos*x^2 - w_vel*v^2 - w_action*a_t^2 - w_action_diff*(a_t - a_{t-1})^2
+# 4. HÀM THƯỞNG CHỐNG "HACK ĐIỂM" CHẠY LÙI (Anti-Runaway Reward)
 reward_weights:
-  r_alive: 1.0                  # Thưởng tồn tại khi góc nằm trong vùng kiểm soát
-  w_theta: 25.0                 # ƯU TIÊN SỐ 1 (85%): Giữ xe dựng đứng tuyệt đối góc theta = 0
-  w_dtheta: 0.40                # ƯU TIÊN SỐ 2 (10%): Khâu cản dập tắt lắc lư hình sin
-  w_pos: 0.50                   # THỨ YẾU (4%): Kéo nhẹ vị trí về gốc, không tranh chấp với góc
-  w_vel: 0.05                   # Hạn chế vận tốc trôi
-  w_action: 0.01                # Phạt năng lượng nhỏ để không làm yếu lực motor
-  w_action_diff: 0.03           # Chống rung giật motor (a_t - a_{t-1})^2
-  fall_penalty: 100.0           # Phạt cực nặng khi ngã xe
+  r_alive: 1.0                  # Chỉ trao thưởng khi góc thật sự thẳng (|theta| < 6 độ)
+  w_theta: 30.0                 # ƯU TIÊN SỐ 1: Ép góc đứng thẳng tuyệt đối
+  w_dtheta: 0.60                # Dập tắt vận tốc lắc lư
+  w_pos: 1.50                   # Kéo vị trí về 0
+  w_vel: 0.50                   # PHẠT NẶNG VẬN TỐC: Cấm tuyệt đối việc phóng chạy lùi
+  w_action: 0.01                # Phạt năng lượng nhỏ
+  w_action_diff: 0.05           # Chống rung giật motor (a_t - a_{t-1})^2
+  fall_penalty: 100.0           # Phạt cực nặng khi ngã (> 12 độ)
 
 # 5. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3
 rl_training:
   algorithm: "PPO"
   net_arch: [64, 64]
-  total_timesteps: 250000       # 250,000 bước (~3 phút trên Colab)
+  total_timesteps: 250000       # 250,000 bước huấn luyện
   learning_rate: 0.0003
   gamma: 0.99
   batch_size: 64
