@@ -44,15 +44,15 @@ domain_randomization:
   imu_noise_std_deg: 0.02       # Nhiễu góc đo MPU6050
   gyro_noise_std_dps: 0.20      # Nhiễu gyro
 
-# 4. HÀM THƯỞNG TRIỆT TIÊU DAO ĐỘNG CON LẮC VÕNG (Anti-Limit-Cycle)
+# 4. HÀM THƯỞNG TRIỆT TIÊU DAO ĐỘNG & GIỮ VỊ TRÍ GỐC (Auto-Centering & Smooth Control)
 reward_weights:
   r_alive: 1.0                  # Thưởng sống sót khi góc đứng thẳng (|theta| < 6 độ)
-  w_theta: 35.0                 # ƯU TIÊN TỐI THƯỢNG: Ghìm chặt góc theta = 0
-  w_dtheta: 2.00                # KHÂU CẢN GÓC CỰC MẠNH: Dập tắt hoàn toàn dao động hình sin
-  w_pos: 0.08                   # GIẢM MẠNH: Không hấp tấp kéo vị trí để tránh quá trớn
-  w_vel: 1.00                   # KHÂU CẢN VẬN TỐC CỰC MẠNH: Triệt tiêu hiện tượng vung lắc
-  w_action: 0.005               # Phạt năng lượng nhỏ
-  w_action_diff: 0.04           # Chống rung giật motor (a_t - a_{t-1})^2
+  w_theta: 25.0                 # Ưu tiên cân bằng đứng thẳng (|theta| < 0.5 độ)
+  w_dtheta: 2.50                # Khâu cản góc mạnh: Dập tắt dao động con lắc võng
+  w_pos: 1.20                   # Kéo vị trí chủ động quay về x = 0 (triệt tiêu trôi lùi)
+  w_vel: 1.50                   # Khâu cản vận tốc: Dập tắt trớn di chuyển, chống vọt lố
+  w_action: 0.010               # Phạt tiêu hao công suất động cơ
+  w_action_diff: 0.80           # Khâu phạt vi sai cực mạnh: Triệt tiêu rung giật răng cưa PWM
   fall_penalty: 100.0           # Phạt nặng khi ngã
 
 # 5. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3
