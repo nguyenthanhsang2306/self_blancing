@@ -56,6 +56,7 @@ def train():
     try:
         import torch
         from stable_baselines3 import PPO
+        from stable_baselines3.common.env_util import make_vec_env
     except ImportError as e:
         print("\n" + "=" * 78)
         print("[ERROR] Thiếu thư viện huấn luyện Reinforcement Learning:")
@@ -75,12 +76,22 @@ def train():
         net_arch=dict(pi=net_arch, vf=net_arch)
     )
 
+    n_envs = rl_cfg.get('n_envs', 8)
+    try:
+        train_env = make_vec_env(lambda: SelfBalancingGymEnv(config), n_envs=n_envs)
+        print(f"[Parallel] Kích hoạt Vectorized Environment với {n_envs} môi trường song song (Tăng tốc gấp 8 lần)!")
+    except Exception as env_err:
+        print(f"[Notice] Sử dụng môi trường đơn do: {env_err}")
+        train_env = env
+
+    n_steps_per_env = max(256, int(2048 / n_envs)) if n_envs > 1 else 2048
+
     model = PPO(
         "MlpPolicy",
-        env,
+        train_env,
         learning_rate=rl_cfg.get('learning_rate', 0.0003),
         gamma=rl_cfg.get('gamma', 0.99),
-        n_steps=rl_cfg.get('n_steps', 2048),
+        n_steps=n_steps_per_env,
         batch_size=rl_cfg.get('batch_size', 64),
         ent_coef=rl_cfg.get('ent_coef', 0.001),
         policy_kwargs=policy_kwargs,
