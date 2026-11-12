@@ -15,7 +15,7 @@ robot_physics:
   M: 0.360            # Khối lượng thân xe danh định (kg)
   m: 0.030            # Khối lượng bánh xe (kg)
   l: 0.031            # Khoảng cách từ trục bánh đến trọng tâm CoG (m)
-  r: 0.020            # Bán kính bánh xe (m, D = 40mm)
+  r: 0.022            # Bán kính bánh xe (m, D = 44mm)
   J: 0.00072          # Mô-men quán tính thân xe quanh trục CoG (kg*m^2)
   b: 0.050            # Hệ số ma sát nhớt tiếp đất (N*s/m)
   Km: 0.28            # Hệ số mô-men động cơ GA12-N20 (N/V)
@@ -59,7 +59,7 @@ reward_weights:
 rl_training:
   algorithm: "PPO"
   net_arch: [64, 64]
-  total_timesteps: 250000       # 250,000 bước huấn luyện
+  total_timesteps: 300000       # 300,000 bước huấn luyện
   learning_rate: 0.0003
   gamma: 0.99
   batch_size: 64

@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import math
 import argparse
@@ -12,8 +13,13 @@ from src.models import NumpyMLPPolicy
 def run_inference():
     parser = argparse.ArgumentParser(description="Test RL Self-Balancing Robot Controller")
     parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to config")
+    parser.add_argument("--weights", type=str, default=None, help="Custom weights .npz path")
     parser.add_argument("--kick", type=float, default=0.0, help="External disturbance force in Newtons (default: 0.0 for pure balance test)")
+    parser.add_argument("--allow-random", action="store_true", help="Allow running with uninitialized random weights (for testing only)")
     args = parser.parse_args()
+
+    if not os.path.exists(args.config):
+        sys.exit(f"[Error] Không tìm thấy file cấu hình: {args.config}")
 
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
@@ -30,12 +36,21 @@ def run_inference():
     net_arch = config['rl_training'].get('net_arch', [64, 64])
     policy = NumpyMLPPolicy(input_dim=obs_dim, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
 
-    ckpt_path = os.path.join(config['export']['checkpoint_dir'], "best_policy.npz")
+    ckpt_path = args.weights if args.weights is not None else os.path.join(config['export']['checkpoint_dir'], "best_policy.npz")
     if os.path.exists(ckpt_path):
         policy.load_weights(ckpt_path)
         print(f"[Model] Đã nạp thành công weights từ: {ckpt_path} (input_dim={policy.input_dim})")
+    elif args.allow_random:
+        print("[Warning] Chạy với trọng số ngẫu nhiên (--allow-random). Robot sẽ không thể cân bằng!")
     else:
-        print("[Model] Checkpoint chưa có, chạy với trọng số khởi tạo ban đầu.")
+        print("\n" + "=" * 78)
+        print(f"[ERROR] Không tìm thấy file checkpoint: {ckpt_path}")
+        print("Mô hình chưa được huấn luyện! Vui lòng thực hiện một trong các bước sau:")
+        print("  1. Huấn luyện trên Google Colab qua notebook `train_colab.ipynb`")
+        print("  2. Chạy `python train.py --config configs/default.yaml` trên môi trường có SB3")
+        print("  3. Thêm cờ `--allow-random` nếu chỉ muốn kiểm thử luồng code với trọng số ngẫu nhiên.")
+        print("=" * 78 + "\n")
+        sys.exit(1)
 
     t_hist = []
     theta_hist = []

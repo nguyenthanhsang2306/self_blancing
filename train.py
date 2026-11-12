@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import yaml
 import numpy as np
@@ -8,10 +9,14 @@ from src.environment import SelfBalancingGymEnv
 from src.models import NumpyMLPPolicy
 
 def train():
-    parser = argparse.ArgumentParser(description="Train RL Self-Balancing Robot via Stable-Baselines3 (PPO/DQN)")
+    parser = argparse.ArgumentParser(description="Train RL Self-Balancing Robot via Stable-Baselines3 (PPO)")
     parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to default.yaml")
     parser.add_argument("--timesteps", type=int, default=None, help="Override training timesteps")
+    parser.add_argument("--demo-sample", action="store_true", help="Generate mock weights for testing without training (NOT for production)")
     args = parser.parse_args()
+
+    if not os.path.exists(args.config):
+        sys.exit(f"[Error] Không tìm thấy file cấu hình: {args.config}")
 
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
@@ -39,58 +44,69 @@ def train():
 
     numpy_policy = NumpyMLPPolicy(input_dim=obs_dim, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
 
-    try:
-        from stable_baselines3 import PPO, DQN
-
-        print(f"[Training] Khởi tạo {algo_name} với mạng 2 tầng ẩn [{obs_dim} -> {net_arch[0]} -> {net_arch[1]} -> 1]...")
-        policy_kwargs = dict(net_arch=net_arch)
-
-        if algo_name == 'DQN':
-            model = DQN(
-                "MlpPolicy",
-                env,
-                learning_rate=rl_cfg.get('learning_rate', 0.0003),
-                gamma=rl_cfg.get('gamma', 0.99),
-                batch_size=rl_cfg.get('batch_size', 64),
-                policy_kwargs=policy_kwargs,
-                verbose=1
-            )
-        else: # PPO
-            model = PPO(
-                "MlpPolicy",
-                env,
-                learning_rate=rl_cfg.get('learning_rate', 0.0003),
-                gamma=rl_cfg.get('gamma', 0.99),
-                n_steps=rl_cfg.get('n_steps', 2048),
-                batch_size=rl_cfg.get('batch_size', 64),
-                ent_coef=rl_cfg.get('ent_coef', 0.001),
-                policy_kwargs=policy_kwargs,
-                verbose=1
-            )
-
-        print(f"[Training] Bắt đầu quá trình huấn luyện {total_timesteps} timesteps...")
-        model.learn(total_timesteps=total_timesteps)
-
-        # Lưu model SB3
+    if args.demo_sample:
+        print("[Notice] Chế độ --demo-sample: Tạo trọng số mẫu để kiểm tra pipeline xuất C.")
         ckpt_dir = config['export']['checkpoint_dir']
         os.makedirs(ckpt_dir, exist_ok=True)
-        sb3_save_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_balancing_robot.zip")
-        model.save(sb3_save_path)
-        print(f"[Checkpoint] Đã lưu model SB3 sang: {sb3_save_path}")
+        demo_npz = os.path.join(ckpt_dir, "demo_sample_policy.npz")
+        numpy_policy.save_weights(demo_npz)
+        print(f"[Demo] Đã lưu trọng số mẫu sang: {demo_npz}")
+        return
 
-        # Trích xuất trọng số sang Numpy
-        numpy_policy.load_from_sb3(model)
+    try:
+        import torch
+        from stable_baselines3 import PPO
+    except ImportError as e:
+        print("\n" + "=" * 78)
+        print("[ERROR] Thiếu thư viện huấn luyện Reinforcement Learning:")
+        print(f"        {e}")
+        print("Huấn luyện PPO yêu cầu: pip install torch stable-baselines3 gymnasium")
+        print("Để huấn luyện đầy đủ và xuất checkpoint thực tế, vui lòng chạy trên Google Colab")
+        print("(sử dụng train_colab.ipynb) hoặc môi trường có GPU/PyTorch.")
+        print("=" * 78 + "\n")
+        sys.exit(1)
 
-    except ImportError:
-        print("[Notice] stable_baselines3 chưa cài đặt trên môi trường cục bộ này.")
-        print("         Đang tạo checkpoint mẫu và xuất file C Header để sẵn sàng nhúng vào STM32.")
-        print("         Khi chạy trên Google Colab / Kaggle, chỉ cần chạy !pip install -r requirements.txt để train đầy đủ.")
+    if algo_name != 'PPO':
+        sys.exit(f"[Error] Thuật toán '{algo_name}' không được hỗ trợ trong pipeline xuất C trực tiếp. Vui lòng chọn 'PPO'.")
 
-    # 3. Lưu weights dạng .npz
+    print(f"[Training] Khởi tạo PPO với kiến trúc actor Tanh: [{obs_dim} -> {net_arch[0]} (Tanh) -> {net_arch[1]} (Tanh) -> 1 (Linear)]...")
+    policy_kwargs = dict(
+        activation_fn=torch.nn.Tanh,
+        net_arch=dict(pi=net_arch, vf=net_arch)
+    )
+
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=rl_cfg.get('learning_rate', 0.0003),
+        gamma=rl_cfg.get('gamma', 0.99),
+        n_steps=rl_cfg.get('n_steps', 2048),
+        batch_size=rl_cfg.get('batch_size', 64),
+        ent_coef=rl_cfg.get('ent_coef', 0.001),
+        policy_kwargs=policy_kwargs,
+        seed=seed,
+        verbose=1
+    )
+
+    print(f"[Training] Bắt đầu quá trình huấn luyện {total_timesteps} timesteps...")
+    model.learn(total_timesteps=total_timesteps)
+
+    # Lưu model SB3
     ckpt_dir = config['export']['checkpoint_dir']
     os.makedirs(ckpt_dir, exist_ok=True)
+    sb3_save_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_balancing_robot.zip")
+    model.save(sb3_save_path)
+    print(f"[Checkpoint] Đã lưu model SB3 sang: {sb3_save_path}")
+
+    # Trích xuất trọng số sang Numpy
+    success = numpy_policy.load_from_sb3(model)
+    if not success:
+        sys.exit("[CRITICAL ERROR] Trích xuất trọng số từ Stable-Baselines3 thất bại! Hủy bỏ xuất C Header.")
+
+    # 3. Lưu weights dạng .npz
     npz_path = os.path.join(ckpt_dir, "best_policy.npz")
     numpy_policy.save_weights(npz_path)
+    print(f"[Checkpoint] Đã lưu weights Numpy sang: {npz_path}")
 
     # 4. Xuất file C Header cho STM32
     hdr_dir = config['export']['header_output_dir']
@@ -104,8 +120,7 @@ def train():
         export_sb3_c_header(numpy_policy, stm32_inc)
         print(f"[Sync] Đã đồng bộ trực tiếp file C Header sang STM32 Project: {stm32_inc}")
 
-    print("\n[Done] Pipeline hoàn thành xuất sắc!")
+    print("\n[Done] Huấn luyện và xuất mô hình hoàn tất thành công 100%!")
 
 if __name__ == "__main__":
     train()
-

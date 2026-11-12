@@ -5,7 +5,10 @@ __pycache__/
 
 # Output artifacts (ignore heavy numpy weights & plots, keep directories)
 outputs/checkpoints/*.npy
+outputs/checkpoints/*.npz
+outputs/checkpoints/*.zip
 outputs/figures/*.png
+*.zip
 
 # Temp / Cache
 Simulink_Cache/
