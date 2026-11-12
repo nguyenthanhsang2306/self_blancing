@@ -20,7 +20,7 @@ robot_physics:
   b: 0.050            # Hệ số ma sát nhớt tiếp đất (N*s/m)
   Km: 0.28            # Hệ số mô-men động cơ GA12-N20 (N/V)
   V_bat: 7.4          # Điện áp pin 2S LiPo danh định (V)
-  deadband: 80.0      # Vùng chết động cơ (PWM / 999)
+  deadband: 0.0       # 0.0 vì driver motor.c trên STM32 đã tự động bù vùng chết mềm (Soft Deadband)
   Ts: 0.005           # Chu kỳ lấy mẫu 200 Hz (5 ms trên ngắt TIM6)
   max_pwm: 999.0      # Giới hạn xung PWM cực đại (TIM1 ARR = 999)
   latency_steps: 1    # Trễ phần cứng cảm biến - truyền động (5 ms)
@@ -47,10 +47,10 @@ domain_randomization:
 # 4. HÀM THƯỞNG TRIỆT TIÊU DAO ĐỘNG & GIỮ VỊ TRÍ GỐC (Auto-Centering & Smooth Control)
 reward_weights:
   r_alive: 1.0                  # Thưởng sống sót khi góc đứng thẳng (|theta| < 6 độ)
-  w_theta: 30.0                 # Ưu tiên cân bằng đứng thẳng (|theta| < 0.5 độ)
+  w_theta: 35.0                 # Ưu tiên cân bằng đứng thẳng (|theta| < 0.5 độ)
   w_dtheta: 3.00                # Khâu cản góc mạnh: Dập tắt dao động con lắc võng
-  w_pos: 2.50                   # Kéo vị trí chủ động quay về x = 0 (khóa chặt vị trí đứng yên)
-  w_vel: 2.00                   # Khâu cản vận tốc: Dập tắt trớn di chuyển, chống vọt lố
+  w_pos: 8.00                   # Kéo vị trí chủ động quay về x = 0 (khóa chặt vị trí đứng yên)
+  w_vel: 3.00                   # Khâu cản vận tốc: Dập tắt trớn di chuyển, chống vọt lố
   w_action: 0.020               # Phạt tiêu hao công suất động cơ
   w_action_diff: 1.50           # Phạt vi sai cực mạnh: Ép PWM mượt mà tuyệt đối, triệt tiêu rung giật
   fall_penalty: 100.0           # Phạt nặng khi ngã

@@ -162,6 +162,8 @@ class SelfBalancingGymEnv(gym.Env):
         return self._get_obs(), {}
 
     def _apply_deadband(self, u_pwm):
+        if self.deadband <= 0.0:
+            return float(np.clip(u_pwm, -self.max_pwm, self.max_pwm))
         mag = abs(u_pwm)
         if mag < self.deadband:
             return 0.0
