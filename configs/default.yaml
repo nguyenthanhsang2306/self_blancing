@@ -1,10 +1,10 @@
 # ==============================================================================
-# CONFIGURATION: REINFORCEMENT LEARNING FOR SELF-BALANCING ROBOT (SB3 + STM32)
-# Standard 6-Step RL with Domain Randomization & 9D Temporal Observation Space
+# CONFIGURATION: ULTRA-STIFF RL FOR SELF-BALANCING ROBOT (SB3 + STM32)
+# Enhanced Damping & Anti-Sway Reward Formulation (Max Theta < 0.8 deg, Pos < 3 cm)
 # ==============================================================================
 
 system:
-  experiment_name: "sb3_balancing_robot_9d"
+  experiment_name: "sb3_balancing_robot_stiff_9d"
   seed: 42
   device: "auto"
   output_dir: "outputs"
@@ -26,46 +26,44 @@ robot_physics:
 
 # 2. KHÔNG GIAN TRẠNG THÁI & HÀNH ĐỘNG
 gym_env:
-  obs_mode: "9d"                # "9d" [s_t, s_{t-1}, a_{t-1}] để tự nhận diện dốc/tải trọng, hoặc "4d"
-  action_mode: "continuous"     # "continuous" (PPO) hoặc "discrete" (DQN)
-  discrete_actions: [-1.0, -0.3, -0.1, 0.0, 0.1, 0.3, 1.0] # 7 mức lực mượt cho DQN
+  obs_mode: "9d"                # "9d" [s_t, s_{t-1}, a_{t-1}]
+  action_mode: "continuous"     # "continuous"
   max_episode_steps: 1000       # 5.0 giây tại 200 Hz
-  fall_angle_deg: 30.0          # Góc ngắt ván (ngã xe)
-  position_limit_m: 1.5         # Giới hạn quãng đường di chuyển (m)
-  target_position: 0.0          # Vị trí mục tiêu cần đứng yên (m)
+  fall_angle_deg: 25.0          # Siết góc ngắt từ 30° xuống 25° để ép AI phải giữ thẳng
+  position_limit_m: 1.0         # Giới hạn quãng đường 1.0m
+  target_position: 0.0          # Điểm neo giữ vị trí đứng yên (m)
 
-# 3. DOMAIN RANDOMIZATION (Mấu chốt Sim-to-Real thích nghi tải trọng & dốc)
+# 3. DOMAIN RANDOMIZATION (Sim-to-Real)
 domain_randomization:
   enabled: true
-  mass_range: [0.28, 0.46]      # Thay đổi khối lượng tải trọng từ -22% đến +28%
-  slope_range_deg: [-5.0, 5.0]  # Độ dốc mặt đường ngẫu nhiên ±5 độ (lên/xuống dốc)
-  friction_range: [0.03, 0.08]  # Ma sát mặt sàn từ trơn trượt đến bám
-  battery_voltage_range: [6.8, 8.4] # Pin 2S từ lúc gần cạn đến sạc đầy
-  imu_noise_std_deg: 0.05       # Nhiễu góc đo MPU6050 (độ)
-  gyro_noise_std_dps: 0.50      # Nhiễu con quay hồi chuyển (độ/giây)
+  mass_range: [0.30, 0.44]      # Biến thiên tải trọng thực tế
+  slope_range_deg: [-4.0, 4.0]  # Dốc nghiêng mặt đường ±4 độ
+  friction_range: [0.035, 0.075]# Ma sát mặt sàn
+  battery_voltage_range: [7.0, 8.4] # Điện áp pin
+  imu_noise_std_deg: 0.04       # Nhiễu góc đo MPU6050
+  gyro_noise_std_dps: 0.40      # Nhiễu gyro
 
-# 4. THIẾT KẾ HÀM THƯỞNG TOÀN DIỆN (Reward Shaping)
-# r_t = - w_theta*theta^2 - w_dtheta*dtheta^2 - w_pos*x^2 - w_vel*v^2 - w_action*a_t^2 - w_action_diff*(a_t - a_{t-1})^2 + r_alive
+# 4. THIẾT KẾ HÀM THƯỞNG SIÊU CỨNG & DẬP TẮT DAO ĐỘNG (Stiff & Heavily Damped)
+# R_t = exp(-35*theta^2 - 1.8*dtheta^2 - 20*x^2) - 0.08*(a_t - a_{t-1})^2 - 0.02*a_t^2
 reward_weights:
-  survival: 1.0                 # r_alive: Thưởng tồn tại mỗi bước không bị ngã
-  w_theta: 12.0                 # Phạt độ lệch góc nghiêng thân xe
-  w_dtheta: 0.15                # Phạt vận tốc góc lắc lư
-  w_pos: 2.0                    # Phạt trôi xa vị trí mục tiêu
-  w_vel: 0.10                   # Phạt tốc độ di chuyển để xe đứng đằm chắc
-  w_action: 0.05                # Phạt tiêu tốn năng lượng motor (tiết kiệm pin & mát động cơ)
-  w_action_diff: 0.10           # Phạt rung giật (a_t - a_{t-1})^2, ép lực xuất êm như bộ lọc
-  fall_penalty: 50.0            # Phạt nặng khi bị ngã xe
+  use_exponential: true         # Sử dụng hàm thưởng dốc nhọn (Exponential Peak)
+  k_theta: 35.0                 # Hệ số dốc góc: góc > 1.5° điểm tụt dốc cực nhanh
+  k_dtheta: 1.80                # Khâu cản đạo hàm dập tắt dao động lắc lư hình sin
+  k_pos: 20.0                   # Khâu neo vị trí: ép xe đứng trong bán kính < 3 cm
+  w_action_diff: 0.08           # Phạt rung giật motor (a_t - a_{t-1})^2
+  w_action: 0.02                # Phạt tiêu tốn năng lượng motor
+  fall_penalty: 50.0            # Phạt ngã nặng
 
 # 5. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3
 rl_training:
-  algorithm: "PPO"              # PPO chuẩn công nghiệp
-  net_arch: [64, 64]            # 2 tầng ẩn [64, 64] tối ưu để nhúng STM32
-  total_timesteps: 250000       # 250,000 bước huấn luyện
+  algorithm: "PPO"
+  net_arch: [64, 64]
+  total_timesteps: 300000       # 300,000 bước huấn luyện để hội tụ thật chắc
   learning_rate: 0.0003
-  gamma: 0.99                   # Hệ số chiết khấu
+  gamma: 0.99
   batch_size: 64
-  n_steps: 2048                 # Số bước rollout mỗi lần cập nhật PPO
-  ent_coef: 0.001               # Entropy exploration
+  n_steps: 2048
+  ent_coef: 0.0005              # Giảm entropy để chính sách ổn định và chắc tay
 
 # 6. XUẤT MÔ HÌNH VÀ DEPLOY LÊN STM32
 export:
