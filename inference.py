@@ -14,25 +14,23 @@ def run_inference():
         config = yaml.safe_load(f)
 
     print("==============================================================================")
-    print("      INFERENCE & HIGH-FIDELITY SIMULATION TEST FOR RL CONTROLLER            ")
+    print("      INFERENCE & HIGH-FIDELITY SIMULATION TEST FOR 9D RL CONTROLLER         ")
     print("==============================================================================")
 
-    # 1. Khởi tạo môi trường
     env = SelfBalancingGymEnv(config)
     obs, _ = env.reset(seed=42)
+    obs_dim = env.observation_space.shape[0]
 
-    # 2. Khởi tạo policy
     net_arch = config['rl_training'].get('net_arch', [64, 64])
-    policy = NumpyMLPPolicy(input_dim=4, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
+    policy = NumpyMLPPolicy(input_dim=obs_dim, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
 
     ckpt_path = os.path.join(config['export']['checkpoint_dir'], "best_policy.npz")
     if os.path.exists(ckpt_path):
         policy.load_weights(ckpt_path)
-        print(f"[Model] Đã nạp thành công weights từ: {ckpt_path}")
+        print(f"[Model] Đã nạp thành công weights từ: {ckpt_path} (input_dim={policy.input_dim})")
     else:
         print("[Model] Checkpoint chưa có, chạy với trọng số khởi tạo ban đầu.")
 
-    # 3. Chạy mô phỏng 5 giây (1000 bước ở 200 Hz)
     t_hist = []
     theta_hist = []
     x_hist = []
@@ -41,7 +39,7 @@ def run_inference():
     dur = 5.0
     steps = int(dur / env.Ts)
 
-    print(f"[Sim] Bắt đầu chạy mô phỏng thời lượng {dur} giây ({steps} bước tại Ts = {env.Ts*1000:.1f}ms)...")
+    print(f"[Sim] Bắt đầu chạy mô phỏng {dur}s ({steps} bước tại Ts = {env.Ts*1000:.1f}ms)...")
     latencies = []
 
     for step_i in range(steps):
@@ -50,12 +48,11 @@ def run_inference():
         # Tác động ngoại lực đẩy mạnh (đòn đấm 1.5 N trong 0.1s tại giây thứ 2.0)
         dist_force = 0.0
         if 2.0 <= t <= 2.10:
-            dist_force = -1.5 # Lực đẩy 1.5 N
+            dist_force = -1.5
 
-        # Đo độ trễ suy luận nơ-ron
         t_start = time.perf_counter()
         action = policy.forward(obs)
-        lat = (time.perf_counter() - t_start) * 1e6 # microseconds
+        lat = (time.perf_counter() - t_start) * 1e6
         latencies.append(lat)
 
         obs, reward, terminated, truncated, info = env.step(action)
@@ -66,14 +63,12 @@ def run_inference():
         pwm_hist.append(info['applied_pwm'])
 
         if terminated:
-            print(f"[Sim] Robot bị ngã tại t = {t:.2f}s (Góc nghiêng = {info['theta_deg']:.1f}°)")
+            print(f"[Sim] Robot ngã tại t = {t:.2f}s (Góc = {info['theta_deg']:.1f}°)")
             break
 
-    # 4. Vẽ đồ thị
     fig_path = os.path.join(config['export']['figures_dir'], "rl_inference_test.png")
     plot_simulation_trajectory(t_hist, theta_hist, x_hist, pwm_hist, fig_path)
 
-    # 5. Đánh giá chỉ số
     avg_lat = np.mean(latencies)
     max_lat = np.max(latencies)
     max_deg = np.max(np.abs(theta_hist))
@@ -84,7 +79,7 @@ def run_inference():
     print(f"  Độ lệch góc lớn nhất        : {max_deg:.2f}° (Ngưỡng ngã: 30°)")
     print(f"  Độ lệch vị trí lớn nhất     : {max_x:.3f} m")
     print(f"  Độ trễ suy luận trung bình  : {avg_lat:.2f} µs (Cực đại: {max_lat:.2f} µs)")
-    print(f"  Thời gian tính chu kỳ 200Hz : 5000 µs -> Tận dụng < 1% CPU của STM32!")
+    print(f"  Thời gian tính chu kỳ 200Hz : 5000 µs -> Tận dụng ~1% CPU của STM32!")
     print("---------------------------------------------------------")
 
 if __name__ == "__main__":

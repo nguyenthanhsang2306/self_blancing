@@ -3,7 +3,7 @@ import argparse
 import yaml
 import numpy as np
 
-from src.utils import set_seed, export_sb3_c_header, plot_simulation_trajectory
+from src.utils import set_seed, export_sb3_c_header
 from src.environment import SelfBalancingGymEnv
 from src.models import NumpyMLPPolicy
 
@@ -18,7 +18,7 @@ def train():
 
     print("==============================================================================")
     print("      REINFORCEMENT LEARNING FOR SELF-BALANCING ROBOT (SB3 + STM32)          ")
-    print("      Framework: Gymnasium + Stable-Baselines3 (PPO/DQN) -> Pure C Header     ")
+    print("      Features: 9D Temporal Observation Space & Domain Randomization           ")
     print("      Target: STM32L476RG (ARM Cortex-M4 @ 80MHz with Hardware FPU)           ")
     print("==============================================================================")
 
@@ -27,8 +27,9 @@ def train():
 
     # 1. Khởi tạo môi trường mô phỏng vật lý Gymnasium
     env = SelfBalancingGymEnv(config)
-    print(f"[Env] Observation space: {env.observation_space.shape}")
-    print(f"[Env] Action space:      {env.action_space}")
+    obs_dim = env.observation_space.shape[0]
+    print(f"[Env] Observation space dimension: {obs_dim}D ({config['gym_env'].get('obs_mode', '9d')})")
+    print(f"[Env] Action space:                {env.action_space}")
 
     # 2. Khởi tạo thuật toán Stable-Baselines3
     rl_cfg = config['rl_training']
@@ -36,17 +37,15 @@ def train():
     algo_name = rl_cfg.get('algorithm', 'PPO').upper()
     net_arch = rl_cfg.get('net_arch', [64, 64])
 
-    numpy_policy = NumpyMLPPolicy(input_dim=4, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
+    numpy_policy = NumpyMLPPolicy(input_dim=obs_dim, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
 
     try:
         from stable_baselines3 import PPO, DQN
-        from stable_baselines3.common.callbacks import CheckpointCallback
 
-        print(f"[Training] Khởi tạo thuật toán {algo_name} với mạng 2 tầng ẩn net_arch={net_arch}...")
+        print(f"[Training] Khởi tạo {algo_name} với mạng 2 tầng ẩn [{obs_dim} -> {net_arch[0]} -> {net_arch[1]} -> 1]...")
         policy_kwargs = dict(net_arch=net_arch)
 
         if algo_name == 'DQN':
-            # Yêu cầu action_mode = 'discrete' trong config
             model = DQN(
                 "MlpPolicy",
                 env,
