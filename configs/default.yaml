@@ -10,7 +10,7 @@ system:
   device: "auto"
   output_dir: "outputs"
 
-# 1. MÔ HÌNH VẬT LÝ ROBOT (Physical Model)
+# 1. MÔ HÌNH VẬT LÝ ROBOT (Physical Model Đồng Bộ 100% STM32)
 robot_physics:
   M: 0.360            # Khối lượng thân xe danh định (kg)
   m: 0.030            # Khối lượng bánh xe (kg)
@@ -20,7 +20,11 @@ robot_physics:
   b: 0.050            # Hệ số ma sát nhớt tiếp đất (N*s/m)
   Km: 0.28            # Hệ số mô-men động cơ GA12-N20 (N/V)
   V_bat: 7.4          # Điện áp pin 2S LiPo danh định (V)
-  deadband: 0.0       # 0.0 vì driver motor.c trên STM32 đã tự động bù vùng chết mềm (Soft Deadband)
+  deadband: 80.0      # Vùng chết động cơ thực tế 80 PWM (motor.c bù vùng chết mềm)
+  ppo_boost: 1.30     # Hệ số khuếch đại lực kéo PPO 1.30x (board_config.h)
+  enc_cpr: 1400.0     # Xung encoder / vòng (CPR)
+  pos_loop_divider: 4 # Vòng encoder cập nhật mỗi 20 ms (50 Hz)
+  vel_filter_n: 10.0  # Bộ lọc đạo hàm vận tốc N = 10 (alpha = 0.1667)
   Ts: 0.005           # Chu kỳ lấy mẫu 200 Hz (5 ms trên ngắt TIM6)
   max_pwm: 999.0      # Giới hạn xung PWM cực đại (TIM1 ARR = 999)
   latency_steps: 1    # Trễ phần cứng cảm biến - truyền động (5 ms)
@@ -60,12 +64,13 @@ rl_training:
   algorithm: "PPO"
   net_arch: [64, 64]
   n_envs: 8                     # Huấn luyện song song 8 môi trường (Tăng tốc gấp 8 lần, mất ~1-2 phút)
-  total_timesteps: 300000       # 300,000 bước huấn luyện chuẩn xác
+  total_timesteps: 400000       # 400,000 bước huấn luyện hội tụ theo curriculum
   learning_rate: 0.0003
   gamma: 0.99
   batch_size: 64
   n_steps: 256
   ent_coef: 0.001
+  eval_freq: 20000              # Đánh giá độc lập mỗi 20,000 bước để chọn best_policy.npz
 
 # 6. XUẤT MÔ HÌNH VÀ DEPLOY LÊN STM32
 export:

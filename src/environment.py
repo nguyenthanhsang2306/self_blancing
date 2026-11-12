@@ -23,12 +23,20 @@ except ImportError:
 
 class SelfBalancingGymEnv(gym.Env):
     """
-    Môi trường Gymnasium chuẩn hóa (Dead-Stiff & Anti-Limit-Cycle):
-      1. Động lực học phi tuyến Runge-Kutta 2 (Midpoint) tại 200 Hz (Ts = 5ms).
+    Môi trường Gymnasium chuẩn hóa Đồng bộ 100% với Firmware STM32L476RG:
+      1. Động lực học phi tuyến Runge-Kutta 2 (Midpoint) tại 200 Hz (Ts = 5 ms).
       2. Observation Space: Vector 9D [s_t, s_{t-1}, a_{t-1}].
-      3. Hàm thưởng triệt tiêu dao động hình sin:
-         Khâu cản vận tốc góc (w_dtheta = 2.0) và khâu cản vận tốc tịnh tiến (w_vel = 1.0)
-         cực mạnh để triệt tiêu hoàn toàn hiện tượng con lắc võng (overshoot/limit cycle).
+      3. Vòng Encoder cập nhật mỗi 20 ms (50 Hz, POS_LOOP_DIVIDER = 4):
+         - Lượng tử hóa vị trí theo xung Encoder (1400 CPR, r = 0.022 m).
+         - Bộ lọc vận tốc đạo hàm bậc 1 với hệ số lọc N = 10 (alpha = 0.1667).
+      4. Đường truyền Actuation đồng bộ với motor.c:
+         - Hệ số khuếch đại lực kéo PPO: DEFAULT_PPO_BOOST = 1.30.
+         - Bộ lọc LPF hành vi 1st-order: u_ppo = 0.60 * u_raw + 0.40 * u_prev.
+         - Lượng tử hóa số nguyên: lroundf(u_ppo).
+         - Bù vùng chết mềm (Soft Deadband Ramp) y hệt motor.c output():
+           mag < 15 -> db = deadband * mag / 15; else db = deadband.
+         - Mô hình động cơ vật lý phản ứng với vùng chết thực tế 80 PWM.
+      5. Hàm thưởng triệt tiêu dao động hình sin & giữ vị trí gốc x = 0.
     """
     metadata = {"render_modes": ["human"], "render_fps": 200}
 
@@ -43,15 +51,24 @@ class SelfBalancingGymEnv(gym.Env):
         self.M_nom = p.get('M', 0.360)
         self.m = p.get('m', 0.030)
         self.l = p.get('l', 0.031)
-        self.r = p.get('r', 0.020)
+        self.r = p.get('r', 0.022)                       # Bán kính bánh xe r = 0.022 m (D = 44 mm)
         self.J_nom = p.get('J', 0.00072)
         self.b_nom = p.get('b', 0.050)
         self.Km = p.get('Km', 0.28)
         self.V_bat_nom = p.get('V_bat', 7.4)
-        self.deadband = p.get('deadband', 80.0)
-        self.Ts = p.get('Ts', 0.005)
+        self.deadband = p.get('deadband', 80.0)           # Vùng chết động cơ vật lý: 80 PWM
+        self.Ts = p.get('Ts', 0.005)                      # Chu kỳ 200 Hz (5 ms)
         self.max_pwm = p.get('max_pwm', 999.0)
+        self.ppo_boost = p.get('ppo_boost', 1.30)         # Hệ số khuếch đại PPO đồng bộ board_config.h
         self.g = 9.81
+
+        # Cấu hình Encoder & Bộ lọc vận tốc đồng bộ board_config.h
+        self.enc_cpr = p.get('enc_cpr', 1400.0)           # 1400 ticks / rev
+        self.tick_m = (2.0 * math.pi * self.r) / self.enc_cpr  # mét / xung
+        self.pos_loop_divider = p.get('pos_loop_divider', 4)   # 4 ticks (20 ms = 50 Hz)
+        self.vel_filter_n = p.get('vel_filter_n', 10.0)        # N = 10
+        self.dt_p = self.Ts * self.pos_loop_divider            # 0.020 s
+        self.alpha_vel = self.dt_p / (self.dt_p + 1.0 / self.vel_filter_n)  # 0.020 / 0.120 = 0.16667
 
         env_cfg = config.get('gym_env', {})
         self.obs_mode = env_cfg.get('obs_mode', '9d')
@@ -62,7 +79,7 @@ class SelfBalancingGymEnv(gym.Env):
         self.pos_limit = env_cfg.get('position_limit_m', 1.0)
         self.target_x = env_cfg.get('target_position', 0.0)
 
-        # Cấu hình Domain Randomization
+        # Domain Randomization
         dr = config.get('domain_randomization', {})
         self.dr_enabled = dr.get('enabled', True)
         self.mass_range = dr.get('mass_range', [0.34, 0.38])
@@ -72,18 +89,18 @@ class SelfBalancingGymEnv(gym.Env):
         self.imu_noise_std = math.radians(dr.get('imu_noise_std_deg', 0.02))
         self.gyro_noise_std = math.radians(dr.get('gyro_noise_std_dps', 0.20))
 
-        # Cấu hình hàm thưởng triệt tiêu dao động
+        # Hàm thưởng
         rw = config.get('reward_weights', {})
         self.r_alive = rw.get('r_alive', 1.0)
         self.w_theta = rw.get('w_theta', 35.0)
-        self.w_dtheta = rw.get('w_dtheta', 2.00)
-        self.w_pos = rw.get('w_pos', 0.08)
-        self.w_vel = rw.get('w_vel', 1.00)
-        self.w_action = rw.get('w_action', 0.005)
-        self.w_action_diff = rw.get('w_action_diff', 0.04)
+        self.w_dtheta = rw.get('w_dtheta', 3.50)
+        self.w_pos = rw.get('w_pos', 4.00)
+        self.w_vel = rw.get('w_vel', 2.50)
+        self.w_action = rw.get('w_action', 0.015)
+        self.w_action_diff = rw.get('w_action_diff', 1.20)
         self.fall_penalty = rw.get('fall_penalty', 100.0)
 
-        # Định nghĩa Observation Space
+        # Observation Space
         if self.obs_mode == '9d':
             high_9d = np.array([
                 self.fall_angle * 1.5, 15.0, self.pos_limit * 1.5, 10.0,
@@ -95,7 +112,7 @@ class SelfBalancingGymEnv(gym.Env):
             high_4d = np.array([self.fall_angle * 1.5, 15.0, self.pos_limit * 1.5, 10.0], dtype=np.float32)
             self.observation_space = spaces.Box(low=-high_4d, high=high_4d, dtype=np.float32)
 
-        # Định nghĩa Action Space
+        # Action Space
         if self.action_mode == 'discrete':
             self.action_space = spaces.Discrete(len(self.discrete_levels))
         else:
@@ -109,25 +126,41 @@ class SelfBalancingGymEnv(gym.Env):
         self.M_tot = self.M + 1.5 * self.m
 
         self.state = np.zeros(4, dtype=np.float32)
-        self.prev_state = np.zeros(4, dtype=np.float32)
+        self.enc_x = 0.0
+        self.enc_x_prev = 0.0
+        self.enc_v = 0.0
+        self.pos_counter = 0
+
+        self.u_prev = 0.0
         self.prev_action = 0.0
         self.step_count = 0
+        self.total_env_steps = 0
         self.latency_buffer = [0.0] * max(1, p.get('latency_steps', 1))
+        self.prev_obs = np.zeros(4, dtype=np.float32)
 
-    def _get_obs(self):
+    def _get_meas_state(self):
+        """Đo lường góc nghiêng (MPU6050) và vị trí/vận tốc (Encoder 20ms)"""
         noise_th = np.random.normal(0.0, self.imu_noise_std) if self.dr_enabled else 0.0
         noise_dth = np.random.normal(0.0, self.gyro_noise_std) if self.dr_enabled else 0.0
 
-        meas_s = self.state.copy()
-        meas_s[0] += noise_th
-        meas_s[1] += noise_dth
+        meas_theta = self.state[0] + noise_th
+        meas_dtheta = self.state[1] + noise_dth
+        meas_x = self.enc_x
+        meas_v = self.enc_v
+
+        return np.array([meas_theta, meas_dtheta, meas_x, meas_v], dtype=np.float32)
+
+    def _get_obs(self):
+        meas_s = self._get_meas_state()
 
         if self.obs_mode == '9d':
-            return np.array([
+            obs = np.array([
                 meas_s[0], meas_s[1], meas_s[2], meas_s[3],
-                self.prev_state[0], self.prev_state[1], self.prev_state[2], self.prev_state[3],
+                self.prev_obs[0], self.prev_obs[1], self.prev_obs[2], self.prev_obs[3],
                 self.prev_action
             ], dtype=np.float32)
+            self.prev_obs = meas_s.copy()
+            return obs
         else:
             return meas_s.astype(np.float32)
 
@@ -135,7 +168,10 @@ class SelfBalancingGymEnv(gym.Env):
         if seed is not None:
             np.random.seed(seed)
 
-        if self.dr_enabled:
+        if options is None:
+            options = {}
+
+        if self.dr_enabled and 'fixed_physics' not in options:
             self.M = np.random.uniform(self.mass_range[0], self.mass_range[1])
             self.J = self.J_nom * (self.M / self.M_nom)
             self.b = np.random.uniform(self.friction_range[0], self.friction_range[1])
@@ -145,35 +181,68 @@ class SelfBalancingGymEnv(gym.Env):
             self.M = self.M_nom
             self.J = self.J_nom
             self.b = self.b_nom
-            self.V_bat = self.V_bat_nom
+            self.V_bat = options.get('v_bat', self.V_bat_nom)
             self.slope_rad = 0.0
 
         self.M_tot = self.M + 1.5 * self.m
 
-        # Khởi tạo góc ban đầu nhẹ [-1.0°, +1.0°]
-        init_theta = np.random.uniform(-math.radians(1.0), math.radians(1.0))
-        init_x = np.random.uniform(-0.005, 0.005)
+        # Curriculum hoặc chỉ định góc ban đầu
+        if 'init_theta_deg' in options:
+            init_theta = math.radians(float(options['init_theta_deg']))
+        else:
+            # Mở rộng dần góc khởi đầu theo curriculum
+            if self.total_env_steps < 80000:
+                curriculum_deg = 1.0
+            elif self.total_env_steps < 200000:
+                curriculum_deg = 3.0
+            else:
+                curriculum_deg = 5.0
+            max_deg = options.get('max_init_deg', curriculum_deg)
+            init_theta = np.random.uniform(-math.radians(max_deg), math.radians(max_deg))
+
+        init_x = float(options.get('init_x', np.random.uniform(-0.005, 0.005)))
         self.state = np.array([init_theta, 0.0, init_x, 0.0], dtype=np.float32)
-        self.prev_state = self.state.copy()
+
+        # Khởi tạo trạng thái Encoder & LPF
+        self.enc_x = round(init_x / self.tick_m) * self.tick_m
+        self.enc_x_prev = self.enc_x
+        self.enc_v = 0.0
+        self.pos_counter = 0
+
+        self.u_prev = 0.0
         self.prev_action = 0.0
         self.step_count = 0
         self.latency_buffer = [0.0] * len(self.latency_buffer)
 
+        # Lên lịch tạo xung lực nhiễu ngẫu nhiên trong huấn luyện (Curriculum Disturbance)
+        self.episode_kick_step = -1
+        self.episode_kick_force = 0.0
+        self.episode_kick_len = 0
+        if self.dr_enabled and 'fixed_physics' not in options and np.random.rand() < 0.35:
+            # 35% số ván trong lúc train sẽ có xung lực ngẫu nhiên tác động (0.7N - 2.0N)
+            self.episode_kick_step = np.random.randint(200, 700)
+            self.episode_kick_force = float(np.random.choice([-1.0, 1.0]) * np.random.uniform(0.7, 2.0))
+            self.episode_kick_len = np.random.randint(10, 25)  # Kéo dài 50 ms - 125 ms
+
+        meas_s = self._get_meas_state()
+        self.prev_obs = meas_s.copy()
+
         return self._get_obs(), {}
 
-    def _apply_deadband(self, u_pwm):
-        if self.deadband <= 0.0:
-            return float(np.clip(u_pwm, -self.max_pwm, self.max_pwm))
-        mag = abs(u_pwm)
-        if mag < self.deadband:
+    def _apply_deadband_and_motor(self, firmware_pwm):
+        """Mô hình phản ứng vật lý của động cơ với vùng chết tĩnh thực tế"""
+        firm_mag = abs(firmware_pwm)
+        if firm_mag < self.deadband:
             return 0.0
-        effective_pwm = math.copysign((mag - self.deadband) * (self.max_pwm / (self.max_pwm - self.deadband)), u_pwm)
-        return float(np.clip(effective_pwm, -self.max_pwm, self.max_pwm))
+        effective = math.copysign(
+            (firm_mag - self.deadband) * (self.max_pwm / (self.max_pwm - self.deadband)),
+            firmware_pwm
+        )
+        return float(np.clip(effective, -self.max_pwm, self.max_pwm))
 
-    def _dynamics(self, s, u_pwm, disturbance=0.0):
+    def _dynamics(self, s, effective_pwm, disturbance=0.0):
         theta, dtheta, x, v = s
 
-        effective_pwm = self._apply_deadband(u_pwm)
         F_motor = (self.Km * (self.V_bat / self.max_pwm)) * effective_pwm
 
         cos_t = math.cos(theta)
@@ -197,6 +266,7 @@ class SelfBalancingGymEnv(gym.Env):
 
     def step(self, action, disturbance=0.0):
         self.step_count += 1
+        self.total_env_steps += 1
 
         if self.action_mode == 'discrete':
             act_idx = int(action)
@@ -208,37 +278,73 @@ class SelfBalancingGymEnv(gym.Env):
                 action_val = float(action)
             action_val = float(np.clip(action_val, -1.0, 1.0))
 
-        # Trễ phần cứng 5 ms
-        self.latency_buffer.append(action_val * self.max_pwm)
-        applied_pwm = self.latency_buffer.pop(0)
+        # === 1. TÍNH TOÁN PWM ĐỒNG BỘ VỚI FIRMWARE STM32 ===
+        # Bước 1.1: Hệ số khuếch đại lực kéo PPO boost (1.30)
+        u_raw = action_val * self.max_pwm * self.ppo_boost
 
-        # Midpoint RK2
-        k1 = self._dynamics(self.state, applied_pwm, disturbance)
+        # Bước 1.2: Bộ lọc thông thấp LPF 1st-order khử rung nơ-ron (0.60 raw + 0.40 prev)
+        u_ppo = 0.60 * u_raw + 0.40 * self.u_prev
+        u_ppo = float(np.clip(u_ppo, -self.max_pwm, self.max_pwm))
+        self.u_prev = u_ppo
+
+        # Bước 1.3: Lượng tử hóa số nguyên lroundf(u_ppo)
+        pwm_int = int(np.round(u_ppo))
+
+        # Bước 1.4: Bù vùng chết mềm (Soft Deadband Ramp) y hệt hàm output() trong motor.c
+        mag = abs(pwm_int)
+        if mag == 0:
+            firmware_pwm = 0
+        else:
+            db = (int(self.deadband) * mag) // 15 if mag < 15 else int(self.deadband)
+            firmware_pwm = int(math.copysign(min(int(self.max_pwm), mag + db), pwm_int))
+
+        # Bước 1.5: Trễ truyền động phần cứng 5 ms
+        self.latency_buffer.append(firmware_pwm)
+        applied_firmware_pwm = self.latency_buffer.pop(0)
+
+        # Bước 1.6: Phản ứng động cơ vật lý với vùng chết thực tế 80
+        effective_pwm = self._apply_deadband_and_motor(applied_firmware_pwm)
+
+        # === 2. MÔ PHỎNG ĐỘNG LỰC HỌC TẠI 200 HZ (5 MS) ===
+        applied_dist = disturbance
+        if applied_dist == 0.0 and self.episode_kick_step > 0:
+            if self.episode_kick_step <= self.step_count < (self.episode_kick_step + self.episode_kick_len):
+                applied_dist = self.episode_kick_force
+
+        k1 = self._dynamics(self.state, effective_pwm, applied_dist)
         state_mid = self.state + 0.5 * self.Ts * k1
-        k2 = self._dynamics(state_mid, applied_pwm, disturbance)
-
-        self.prev_state = self.state.copy()
+        k2 = self._dynamics(state_mid, effective_pwm, applied_dist)
         self.state = self.state + self.Ts * k2
 
         theta, dtheta, x, v = self.state
 
-        # Ngắt ván nếu góc nghiêng quá 15 độ
+        # === 3. VÒNG ENCODER CẬP NHẬT MỖI 20 MS (POS_LOOP_DIVIDER = 4) ===
+        self.pos_counter += 1
+        if self.pos_counter >= self.pos_loop_divider:
+            self.pos_counter = 0
+            # Lượng tử hóa theo độ phân giải xung thực tế (1400 CPR)
+            self.enc_x = round(x / self.tick_m) * self.tick_m
+            raw_v = (self.enc_x - self.enc_x_prev) / self.dt_p
+            self.enc_x_prev = self.enc_x
+            # Bộ lọc đạo hàm vận tốc bậc 1 (N = 10)
+            self.enc_v += self.alpha_vel * (raw_v - self.enc_v)
+
+        # Ngắt ván nếu góc nghiêng quá 15 độ (chuẩn FALL_ANGLE_DEG của firmware)
         is_fallen = abs(theta) > self.fall_angle
         is_out_of_bounds = abs(x) > self.pos_limit
         terminated = bool(is_fallen or is_out_of_bounds)
         truncated = bool(self.step_count >= self.max_steps)
 
-        # HÀM THƯỞNG TRIỆT TIÊU HOÀN TOÀN DAO ĐỘNG CON LẮC VÕNG
+        # === 4. HÀM THƯỞNG ===
         action_diff = action_val - self.prev_action
         dx = x - self.target_x
 
-        # Chỉ thưởng khi góc đứng thẳng an toàn (|theta| < 6 độ)
         alive_reward = self.r_alive if abs(theta) < math.radians(6.0) else 0.0
 
         reward = (alive_reward
                   - self.w_theta * (theta ** 2)
                   - self.w_dtheta * (dtheta ** 2)     # Dập tắt lắc lư hình sin
-                  - self.w_pos * (dx ** 2)           # Trọng số nhẹ, không gây quá trớn
+                  - self.w_pos * (dx ** 2)           # Khóa vị trí đứng yên x = 0
                   - self.w_vel * (v ** 2)            # Triệt tiêu vận tốc vung lắc
                   - self.w_action * (action_val ** 2)
                   - self.w_action_diff * (action_diff ** 2))
@@ -251,10 +357,17 @@ class SelfBalancingGymEnv(gym.Env):
         info = {
             "theta_deg": math.degrees(theta),
             "x_pos": x,
-            "applied_pwm": applied_pwm,
+            "v_vel": v,
+            "enc_x": self.enc_x,
+            "enc_v": self.enc_v,
+            "u_ppo": u_ppo,
+            "firmware_pwm": firmware_pwm,
+            "applied_pwm": applied_firmware_pwm,
+            "effective_pwm": effective_pwm,
             "step": self.step_count,
             "slope_deg": math.degrees(self.slope_rad),
-            "mass_kg": self.M
+            "mass_kg": self.M,
+            "v_bat": self.V_bat
         }
 
         return self._get_obs(), float(reward), terminated, truncated, info
