@@ -1,10 +1,10 @@
 # ==============================================================================
-# CONFIGURATION: ULTRA-STIFF RL FOR SELF-BALANCING ROBOT (SB3 + STM32)
-# Enhanced Damping & Anti-Sway Reward Formulation (Max Theta < 0.8 deg, Pos < 3 cm)
+# CONFIGURATION: STABLE 9D PPO FOR TWO-WHEELED SELF-BALANCING ROBOT
+# Verified Additive Reward: Angle Priority (85%) > Damping (10%) > Position (5%)
 # ==============================================================================
 
 system:
-  experiment_name: "sb3_balancing_robot_stiff_9d"
+  experiment_name: "sb3_balancing_robot_stable_9d"
   seed: 42
   device: "auto"
   output_dir: "outputs"
@@ -29,41 +29,42 @@ gym_env:
   obs_mode: "9d"                # "9d" [s_t, s_{t-1}, a_{t-1}]
   action_mode: "continuous"     # "continuous"
   max_episode_steps: 1000       # 5.0 giây tại 200 Hz
-  fall_angle_deg: 25.0          # Siết góc ngắt từ 30° xuống 25° để ép AI phải giữ thẳng
-  position_limit_m: 1.0         # Giới hạn quãng đường 1.0m
-  target_position: 0.0          # Điểm neo giữ vị trí đứng yên (m)
+  fall_angle_deg: 28.0          # Góc ngắt ván (ngã xe)
+  position_limit_m: 1.5         # Giới hạn quãng đường 1.5m
+  target_position: 0.0          # Vị trí mục tiêu cần đứng yên (m)
 
 # 3. DOMAIN RANDOMIZATION (Sim-to-Real)
 domain_randomization:
   enabled: true
-  mass_range: [0.30, 0.44]      # Biến thiên tải trọng thực tế
-  slope_range_deg: [-4.0, 4.0]  # Dốc nghiêng mặt đường ±4 độ
-  friction_range: [0.035, 0.075]# Ma sát mặt sàn
-  battery_voltage_range: [7.0, 8.4] # Điện áp pin
-  imu_noise_std_deg: 0.04       # Nhiễu góc đo MPU6050
-  gyro_noise_std_dps: 0.40      # Nhiễu gyro
+  mass_range: [0.32, 0.42]      # Tải trọng thay đổi thực tế
+  slope_range_deg: [-2.5, 2.5]  # Độ dốc ngẫu nhiên nhẹ để AI học vững vàng
+  friction_range: [0.04, 0.07]  # Ma sát mặt sàn
+  battery_voltage_range: [7.2, 8.4] # Điện áp pin
+  imu_noise_std_deg: 0.03       # Nhiễu góc đo MPU6050
+  gyro_noise_std_dps: 0.30      # Nhiễu con quay hồi chuyển Gyro
 
-# 4. THIẾT KẾ HÀM THƯỞNG SIÊU CỨNG & DẬP TẮT DAO ĐỘNG (Stiff & Heavily Damped)
-# R_t = exp(-35*theta^2 - 1.8*dtheta^2 - 20*x^2) - 0.08*(a_t - a_{t-1})^2 - 0.02*a_t^2
+# 4. HÀM THƯỞNG CHUẨN CÔNG THỨC (Angle Dominant Additive Reward)
+# r_t = r_alive - w_theta*theta^2 - w_dtheta*dtheta^2 - w_pos*x^2 - w_vel*v^2 - w_action*a_t^2 - w_action_diff*(a_t - a_{t-1})^2
 reward_weights:
-  use_exponential: true         # Sử dụng hàm thưởng dốc nhọn (Exponential Peak)
-  k_theta: 35.0                 # Hệ số dốc góc: góc > 1.5° điểm tụt dốc cực nhanh
-  k_dtheta: 1.80                # Khâu cản đạo hàm dập tắt dao động lắc lư hình sin
-  k_pos: 20.0                   # Khâu neo vị trí: ép xe đứng trong bán kính < 3 cm
-  w_action_diff: 0.08           # Phạt rung giật motor (a_t - a_{t-1})^2
-  w_action: 0.02                # Phạt tiêu tốn năng lượng motor
-  fall_penalty: 50.0            # Phạt ngã nặng
+  r_alive: 1.0                  # Thưởng tồn tại khi góc nằm trong vùng kiểm soát
+  w_theta: 25.0                 # ƯU TIÊN SỐ 1 (85%): Giữ xe dựng đứng tuyệt đối góc theta = 0
+  w_dtheta: 0.40                # ƯU TIÊN SỐ 2 (10%): Khâu cản dập tắt lắc lư hình sin
+  w_pos: 0.50                   # THỨ YẾU (4%): Kéo nhẹ vị trí về gốc, không tranh chấp với góc
+  w_vel: 0.05                   # Hạn chế vận tốc trôi
+  w_action: 0.01                # Phạt năng lượng nhỏ để không làm yếu lực motor
+  w_action_diff: 0.03           # Chống rung giật motor (a_t - a_{t-1})^2
+  fall_penalty: 100.0           # Phạt cực nặng khi ngã xe
 
 # 5. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3
 rl_training:
   algorithm: "PPO"
   net_arch: [64, 64]
-  total_timesteps: 300000       # 300,000 bước huấn luyện để hội tụ thật chắc
+  total_timesteps: 250000       # 250,000 bước (~3 phút trên Colab)
   learning_rate: 0.0003
   gamma: 0.99
   batch_size: 64
   n_steps: 2048
-  ent_coef: 0.0005              # Giảm entropy để chính sách ổn định và chắc tay
+  ent_coef: 0.001
 
 # 6. XUẤT MÔ HÌNH VÀ DEPLOY LÊN STM32
 export:

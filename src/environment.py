@@ -23,14 +23,14 @@ except ImportError:
 
 class SelfBalancingGymEnv(gym.Env):
     """
-    Môi trường Gymnasium nâng cao cho Robot 2 bánh tự cân bằng (Ultra-Stiff Formulation):
+    Môi trường Gymnasium chuẩn hóa cho Robot 2 bánh tự cân bằng (Angle-Dominant PPO):
       1. Động lực học phi tuyến Runge-Kutta 2 (Midpoint) tại 200 Hz (Ts = 5ms).
       2. Domain Randomization (Sim-to-Real): ngẫu nhiên hóa tải trọng, độ dốc mặt đường,
          ma sát sàn, sụt áp pin và nhiễu cảm biến MPU6050.
       3. Observation Space: Vector 9D [s_t, s_{t-1}, a_{t-1}] để tự nhận diện dốc và tải trọng.
-      4. Hàm thưởng siêu cứng & dập tắt dao động:
-         R_t = exp(-35*theta^2 - 1.8*dtheta^2 - 20*x^2) - 0.08*(a_t - a_{t-1})^2 - 0.02*a_t^2
-         Ép góc nghiêng < 0.8° và vị trí < 3 cm!
+      4. Hàm thưởng cộng tính chuẩn (Additive Reward):
+         r_t = r_alive - w_theta*theta^2 - w_dtheta*dtheta^2 - w_pos*x^2 - w_vel*v^2 - w_action*a_t^2 - w_action_diff*(a_t - a_{t-1})^2
+         Ưu tiên số 1: Giữ góc nghiêng theta = 0 (85% trọng số), dập tắt dao động và chống giật.
     """
     metadata = {"render_modes": ["human"], "render_fps": 200}
 
@@ -60,29 +60,30 @@ class SelfBalancingGymEnv(gym.Env):
         self.action_mode = env_cfg.get('action_mode', 'continuous')
         self.discrete_levels = np.array(env_cfg.get('discrete_actions', [-1.0, -0.3, -0.1, 0.0, 0.1, 0.3, 1.0]), dtype=np.float32)
         self.max_steps = env_cfg.get('max_episode_steps', 1000)
-        self.fall_angle = math.radians(env_cfg.get('fall_angle_deg', 25.0))
-        self.pos_limit = env_cfg.get('position_limit_m', 1.0)
+        self.fall_angle = math.radians(env_cfg.get('fall_angle_deg', 28.0))
+        self.pos_limit = env_cfg.get('position_limit_m', 1.5)
         self.target_x = env_cfg.get('target_position', 0.0)
 
         # Cấu hình Domain Randomization
         dr = config.get('domain_randomization', {})
         self.dr_enabled = dr.get('enabled', True)
-        self.mass_range = dr.get('mass_range', [0.30, 0.44])
-        self.slope_range_deg = dr.get('slope_range_deg', [-4.0, 4.0])
-        self.friction_range = dr.get('friction_range', [0.035, 0.075])
-        self.vbat_range = dr.get('battery_voltage_range', [7.0, 8.4])
-        self.imu_noise_std = math.radians(dr.get('imu_noise_std_deg', 0.04))
-        self.gyro_noise_std = math.radians(dr.get('gyro_noise_std_dps', 0.40))
+        self.mass_range = dr.get('mass_range', [0.32, 0.42])
+        self.slope_range_deg = dr.get('slope_range_deg', [-2.5, 2.5])
+        self.friction_range = dr.get('friction_range', [0.04, 0.07])
+        self.vbat_range = dr.get('battery_voltage_range', [7.2, 8.4])
+        self.imu_noise_std = math.radians(dr.get('imu_noise_std_deg', 0.03))
+        self.gyro_noise_std = math.radians(dr.get('gyro_noise_std_dps', 0.30))
 
-        # Cấu hình hàm thưởng siêu cứng
+        # Cấu hình hàm thưởng
         rw = config.get('reward_weights', {})
-        self.use_exp = rw.get('use_exponential', True)
-        self.k_theta = rw.get('k_theta', 35.0)
-        self.k_dtheta = rw.get('k_dtheta', 1.80)
-        self.k_pos = rw.get('k_pos', 20.0)
-        self.w_action_diff = rw.get('w_action_diff', 0.08)
-        self.w_action = rw.get('w_action', 0.02)
-        self.fall_penalty = rw.get('fall_penalty', 50.0)
+        self.r_alive = rw.get('r_alive', 1.0)
+        self.w_theta = rw.get('w_theta', 25.0)
+        self.w_dtheta = rw.get('w_dtheta', 0.40)
+        self.w_pos = rw.get('w_pos', 0.50)
+        self.w_vel = rw.get('w_vel', 0.05)
+        self.w_action = rw.get('w_action', 0.01)
+        self.w_action_diff = rw.get('w_action_diff', 0.03)
+        self.fall_penalty = rw.get('fall_penalty', 100.0)
 
         # Định nghĩa Observation Space
         if self.obs_mode == '9d':
@@ -136,7 +137,6 @@ class SelfBalancingGymEnv(gym.Env):
         if seed is not None:
             np.random.seed(seed)
 
-        # Domain Randomization
         if self.dr_enabled:
             self.M = np.random.uniform(self.mass_range[0], self.mass_range[1])
             self.J = self.J_nom * (self.M / self.M_nom)
@@ -152,9 +152,9 @@ class SelfBalancingGymEnv(gym.Env):
 
         self.M_tot = self.M + 1.5 * self.m
 
-        # Góc lệch ban đầu nhỏ ([-3°, +3°])
-        init_theta = np.random.uniform(-math.radians(3.0), math.radians(3.0))
-        init_x = np.random.uniform(-0.015, 0.015)
+        # Nghiêng ban đầu nhẹ ([-2.5°, +2.5°])
+        init_theta = np.random.uniform(-math.radians(2.5), math.radians(2.5))
+        init_x = np.random.uniform(-0.01, 0.01)
         self.state = np.array([init_theta, 0.0, init_x, 0.0], dtype=np.float32)
         self.prev_state = self.state.copy()
         self.prev_action = 0.0
@@ -227,16 +227,20 @@ class SelfBalancingGymEnv(gym.Env):
         terminated = bool(is_fallen or is_out_of_bounds)
         truncated = bool(self.step_count >= self.max_steps)
 
-        # HÀM THƯỞNG SIÊU CỨNG & DẬP TẮT DAO ĐỘNG
+        # 4. HÀM THƯỞNG CỘNG TÍNH CHUẨN (Angle-Dominant Additive Reward)
         action_diff = action_val - self.prev_action
         dx = x - self.target_x
 
-        if self.use_exp:
-            # Hàm thưởng mũ dốc nhọn
-            exp_term = math.exp(- self.k_theta * (theta ** 2) - self.k_dtheta * (dtheta ** 2) - self.k_pos * (dx ** 2))
-            reward = exp_term - self.w_action_diff * (action_diff ** 2) - self.w_action * (action_val ** 2)
-        else:
-            reward = 1.0 - self.k_theta * (theta ** 2) - self.k_dtheta * (dtheta ** 2) - self.k_pos * (dx ** 2) - self.w_action_diff * (action_diff ** 2)
+        # Thưởng tồn tại khi góc còn kiểm soát được (|theta| < 15 độ)
+        alive_reward = self.r_alive if abs(theta) < math.radians(15.0) else 0.0
+
+        reward = (alive_reward
+                  - self.w_theta * (theta ** 2)
+                  - self.w_dtheta * (dtheta ** 2)
+                  - self.w_pos * (dx ** 2)
+                  - self.w_vel * (v ** 2)
+                  - self.w_action * (action_val ** 2)
+                  - self.w_action_diff * (action_diff ** 2))
 
         if terminated:
             reward -= self.fall_penalty
