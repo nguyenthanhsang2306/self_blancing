@@ -59,7 +59,7 @@ reward_weights:
 rl_training:
   algorithm: "PPO"
   net_arch: [64, 64]
-  total_timesteps: 300000       # 300,000 bước huấn luyện
+  total_timesteps: 600000       # 600,000 bước huấn luyện chuyên sâu (~6-7 phút trên Colab)
   learning_rate: 0.0003
   gamma: 0.99
   batch_size: 64
