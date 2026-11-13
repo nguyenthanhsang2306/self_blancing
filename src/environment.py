@@ -31,7 +31,7 @@ class SelfBalancingGymEnv(gym.Env):
          - Bộ lọc vận tốc đạo hàm bậc 1 với hệ số lọc N = 10 (alpha = 0.1667).
       4. Đường truyền Actuation đồng bộ với motor.c:
          - Hệ số khuếch đại lực kéo PPO: DEFAULT_PPO_BOOST = 1.30.
-         - Bộ lọc LPF hành vi 1st-order: u_ppo = 0.30 * u_raw + 0.70 * u_prev.
+         - Bộ lọc LPF hành vi 1st-order: u_ppo = 0.60 * u_raw + 0.40 * u_prev.
          - Lượng tử hóa số nguyên: lroundf(u_ppo).
          - Bù vùng chết mềm (Soft Deadband Ramp) y hệt motor.c output():
            mag < 15 -> db = deadband * mag / 15; else db = deadband.

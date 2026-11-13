@@ -18,6 +18,8 @@ def train():
     parser = argparse.ArgumentParser(description="Train RL Self-Balancing Robot via Stable-Baselines3 (PPO)")
     parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to default.yaml")
     parser.add_argument("--timesteps", type=int, default=None, help="Override training timesteps")
+    parser.add_argument("--w-pos", type=float, default=None, help="Override reward_weights.w_pos")
+    parser.add_argument("--tag", type=str, default=None, help="Optional suffix tag for checkpoint and header outputs")
     parser.add_argument("--demo-sample", action="store_true", help="Generate mock weights for testing without training")
     args = parser.parse_args()
 
@@ -26,6 +28,10 @@ def train():
 
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+
+    if args.w_pos is not None:
+        config.setdefault('reward_weights', {})['w_pos'] = float(args.w_pos)
+        print(f"[Config Override] reward_weights.w_pos = {config['reward_weights']['w_pos']:.4f}")
 
     print("==============================================================================")
     print("      REINFORCEMENT LEARNING FOR SELF-BALANCING ROBOT (SB3 PPO + STM32)      ")
@@ -107,67 +113,86 @@ def train():
         verbose=1
     )
 
-    # Callback đánh giá độc lập để chọn Checkpoint xuất sắc nhất
+    ckpt_dir = config['export']['checkpoint_dir']
+    os.makedirs(ckpt_dir, exist_ok=True)
+    tag_suffix = f"_{args.tag}" if args.tag else ""
+    best_npz_path = os.path.join(ckpt_dir, f"best_policy{tag_suffix}.npz")
+    final_npz_path = os.path.join(ckpt_dir, f"final_policy{tag_suffix}.npz")
+    final_sb3_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_final_model{tag_suffix}.zip")
+
+    # Xóa checkpoint cũ của các lần train trước để chỉ chọn checkpoint trong lần train hiện tại
+    if os.path.exists(best_npz_path):
+        os.remove(best_npz_path)
+        print(f"[Cleanup] Đã xóa checkpoint cũ {best_npz_path} để tránh dùng nhầm kết quả đợt train trước.")
+
+    def _fmt_eval_line(step_label, summary):
+        settle_str = f"{summary['mean_settle_s']:.2f}s" if summary['mean_settle_s'] is not None else "N/A"
+        return (
+            f"[{step_label}] Ngã: {summary['fall_count']}/{summary['total_runs']} ({summary['fall_rate_pct']:.1f}%) | "
+            f"Giữ VT: {summary['hold_count']}/{summary['total_runs']} | "
+            f"Final X: {summary['mean_final_x_m']*100:.2f}cm | Settle: {settle_str}"
+        )
+
+    # Callback đánh giá độc lập để chọn Checkpoint tốt nhất của riêng lần train này
     class BestCheckpointCallback(BaseCallback):
         def __init__(self, eval_freq=20000, verbose=1):
             super().__init__(verbose)
             self.eval_freq = max(1, eval_freq // n_envs)
-            self.best_score = -float('inf')
+            self.best_key = None
             self.best_step = 0
-            self.best_fall_rate = 100.0
+            self.has_best = False
 
         def _on_step(self) -> bool:
             if self.n_calls % self.eval_freq == 0:
                 numpy_policy.load_from_sb3(self.model)
                 summary = evaluator.evaluate(numpy_policy, quick_eval=True)
-                score = summary['composite_score']
-                fall_rate = summary['fall_rate_pct']
+                key = summary['ranking_key']
 
                 if self.verbose > 0:
-                    print(f"\n[Eval @ Step {self.num_timesteps}] Điểm: {score:.1f} | Ngã: {fall_rate:.1f}% | Settle: {summary['mean_settle_s']:.2f}s | Max X: {summary['mean_max_x_m']*100:.1f}cm")
+                    print("\n" + _fmt_eval_line(f"Eval @ Step {self.num_timesteps}", summary))
 
-                if score > self.best_score:
-                    self.best_score = score
+                if self.best_key is None or key > self.best_key:
+                    self.best_key = key
                     self.best_step = self.num_timesteps
-                    self.best_fall_rate = fall_rate
-
-                    # Chỉ lưu model tốt nhất vào best_policy.npz
-                    ckpt_dir = config['export']['checkpoint_dir']
-                    os.makedirs(ckpt_dir, exist_ok=True)
-                    npz_path = os.path.join(ckpt_dir, "best_policy.npz")
-                    numpy_policy.save_weights(npz_path)
+                    self.has_best = True
+                    numpy_policy.save_weights(best_npz_path)
 
                     if self.verbose > 0:
-                        print(f"  >>> [NEW BEST CHECKPOINT] Đã cập nhật best_policy.npz tại step {self.num_timesteps} (Điểm={score:.1f}, Ngã={fall_rate:.1f}%)!\n")
+                        print(f"  >>> [NEW BEST CHECKPOINT] Đã cập nhật {best_npz_path} tại step {self.num_timesteps}!\n")
 
             return True
 
     eval_callback = BestCheckpointCallback(eval_freq=rl_cfg.get('eval_freq', 20000), verbose=1)
 
-    print(f"[Training] Bắt đầu quá trình huấn luyện {total_timesteps} timesteps...")
+    print(f"[Training] Bắt đầu quá trình huấn luyện {total_timesteps} timesteps (w_pos={config['reward_weights']['w_pos']})...")
     model.learn(total_timesteps=total_timesteps, callback=eval_callback)
 
-    ckpt_dir = config['export']['checkpoint_dir']
-    os.makedirs(ckpt_dir, exist_ok=True)
-    # Lưu model cuối cùng vào final_policy (không ghi đè best_policy!)
-    final_sb3_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_final_model.zip")
+    # Lưu model cuối cùng vào final_policy (không ghi đè best_policy nếu chưa đánh giá!)
     model.save(final_sb3_path)
-    final_npz_path = os.path.join(ckpt_dir, "final_policy.npz")
     numpy_policy.load_from_sb3(model)
     numpy_policy.save_weights(final_npz_path)
     print(f"\n[Checkpoint] Đã lưu model cuối đợt train sang: {final_npz_path}")
 
-    # ĐẢM BẢO CHỈ XUẤT C HEADER TỪ CHECKPOINT XUẤT SẮC NHẤT
-    best_npz_path = os.path.join(ckpt_dir, "best_policy.npz")
-    if os.path.exists(best_npz_path):
-        numpy_policy.load_weights(best_npz_path)
-        print(f"[Final Selection] Đã chọn Checkpoint xuất sắc nhất từ: {best_npz_path}")
-    else:
-        print("[Notice] Sử dụng final model vì chưa có best_policy.npz")
+    # Đánh giá nhanh model cuối để so với checkpoint tốt nhất trong chính lần train hiện tại
+    final_quick = evaluator.evaluate(numpy_policy, quick_eval=True)
+    print(_fmt_eval_line(f"Eval @ Final ({total_timesteps})", final_quick))
+    if (not eval_callback.has_best) or (final_quick['ranking_key'] > eval_callback.best_key):
+        eval_callback.best_key = final_quick['ranking_key']
+        eval_callback.best_step = total_timesteps
+        eval_callback.has_best = True
+        numpy_policy.save_weights(best_npz_path)
+        print(f"  >>> [NEW BEST CHECKPOINT] Model cuối đợt train đạt hạng cao nhất -> {best_npz_path}")
 
-    # Đánh giá độc lập toàn diện 90 kịch bản trên Checkpoint tốt nhất
+    # ĐẢM BẢO CHỈ CHỌN CHECKPOINT CỦA LẦN TRAIN HIỆN TẠI
+    if eval_callback.has_best and os.path.exists(best_npz_path):
+        numpy_policy.load_weights(best_npz_path)
+        print(f"[Final Selection] Đã chọn Checkpoint tốt nhất của lần train này (step {eval_callback.best_step}): {best_npz_path}")
+    else:
+        print("[Notice] Sử dụng final model trong phiên chạy hiện tại.")
+
+    # Đánh giá độc lập toàn diện (90 ca 10s + 6 ca dài 20–30s) trên Checkpoint tốt nhất
     print("\n" + "=" * 78)
-    print("      ĐÁNH GIÁ ĐỘC LẬP TOÀN DIỆN TRÊN CHECKPOINT XUẤT SẮC NHẤT (90 BÀI TEST) ")
+    print("      ĐÁNH GIÁ ĐỘC LẬP TOÀN DIỆN TRÊN CHECKPOINT TỐT NHẤT (96 BÀI TEST) ")
     print("=" * 78)
     summary = evaluator.evaluate(numpy_policy, quick_eval=False)
     report = evaluator.format_report(summary)
@@ -175,14 +200,20 @@ def train():
 
     # XUẤT C HEADER SAU KHI ĐÃ ĐÁNH GIÁ VÀ XÁC NHẬN CHẤT LƯỢNG
     hdr_dir = config['export']['header_output_dir']
-    hdr_name = config['export'].get('header_filename', 'rl_sb3_stm32.h')
+    base_hdr = config['export'].get('header_filename', 'rl_sb3_stm32.h')
+    if args.tag:
+        stem, ext = os.path.splitext(base_hdr)
+        hdr_name = f"{stem}{tag_suffix}{ext}"
+    else:
+        hdr_name = base_hdr
     hdr_path = os.path.join(hdr_dir, hdr_name)
     export_sb3_c_header(numpy_policy, hdr_path)
 
-    stm32_inc = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Project_self", "Core", "Inc", hdr_name))
-    if os.path.isdir(os.path.dirname(stm32_inc)):
-        export_sb3_c_header(numpy_policy, stm32_inc)
-        print(f"[Sync] Đã đồng bộ trực tiếp file C Header sang STM32 Project: {stm32_inc}")
+    if not args.tag:
+        stm32_inc = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Project_self", "Core", "Inc", base_hdr))
+        if os.path.isdir(os.path.dirname(stm32_inc)):
+            export_sb3_c_header(numpy_policy, stm32_inc)
+            print(f"[Sync] Đã đồng bộ trực tiếp file C Header sang STM32 Project: {stm32_inc}")
 
     print("[Done] Huấn luyện, đánh giá độc lập và xuất mô hình hoàn tất 100%!")
 
