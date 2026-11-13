@@ -294,8 +294,8 @@ class SelfBalancingGymEnv(gym.Env):
         # Bước 1.1: Hệ số khuếch đại lực kéo PPO boost (1.30)
         u_raw = action_val * self.max_pwm * self.ppo_boost
 
-        # Bước 1.2: Bộ lọc thông thấp LPF 1st-order khử rung nơ-ron (0.30 raw + 0.70 prev, fc ~ 10 Hz)
-        u_ppo = 0.30 * u_raw + 0.70 * self.u_prev
+        # Bước 1.2: Bộ lọc thông thấp LPF 1st-order cân bằng (0.50 raw + 0.50 prev, phản xạ nhanh và lọc mượt)
+        u_ppo = 0.50 * u_raw + 0.50 * self.u_prev
         u_ppo = float(np.clip(u_ppo, -self.max_pwm, self.max_pwm))
         self.u_prev = u_ppo
 

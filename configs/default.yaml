@@ -48,15 +48,15 @@ domain_randomization:
   imu_noise_std_deg: 0.02       # Nhiễu góc đo MPU6050
   gyro_noise_std_dps: 0.20      # Nhiễu gyro
 
-# 4. HÀM THƯỞNG TRIỆT TIÊU CỘNG HƯỞNG VÀ RUNG GIẬT (Angle-First, Smooth Centering)
+# 4. HÀM THƯỞNG CÂN BẰNG HOÀN HẢO (Golden Balance: Fast Reflex, Zero Oscillation, No Chatter)
 reward_weights:
   r_alive: 1.0                  # Thưởng sống sót khi góc đứng thẳng (|theta| < 6 độ)
   w_theta: 35.0                 # ƯU TIÊN SỐ 1: Giữ thân xe tuyệt đối thẳng đứng (|theta| < 0.5 độ)
   w_dtheta: 3.50                # Phanh con lắc góc: Dập tắt dao động nghiêng tức thì
-  w_pos: 0.50                   # Kéo về x = 0 trong 3-4s (tăng từ 0.12 để không trôi 10s, nhưng không quá 4.5 gây lắc 3.8s)
-  w_vel: 2.20                   # Cản vận tốc di chuyển: Dập tắt quán tính, chống vọt lố vị trí
+  w_pos: 0.25                   # Kéo về x = 0 êm dịu (gấp đôi 0.12 để không trôi 10s, nhưng không quá lớn gây lắc)
+  w_vel: 1.60                   # Cản vận tốc di chuyển: Dập tắt quán tính, chống trôi và chống vọt lố
   w_action: 0.010               # Phạt công suất tiêu hao
-  w_action_diff: 8.00           # Ép PWM trơn mượt, triệt tiêu 100% xung gai và rung giật "chổi cỏ"
+  w_action_diff: 2.50           # Phạt xung giật vừa đủ (tránh trễ pha tê liệt phản xạ như mức 8.0)
   fall_penalty: 100.0           # Phạt nặng khi ngã
 
 # 5. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3
