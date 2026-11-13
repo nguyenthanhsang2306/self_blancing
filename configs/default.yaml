@@ -48,15 +48,15 @@ domain_randomization:
   imu_noise_std_deg: 0.02       # Nhiễu góc đo MPU6050
   gyro_noise_std_dps: 0.20      # Nhiễu gyro
 
-# 4. HÀM THƯỞNG CÂN BẰNG HOÀN HẢO (Golden Balance: Fast Reflex, Zero Oscillation, No Chatter)
+# 4. HÀM THƯỞNG CÂN BẰNG PHẢN XẠ NHANH (Fast Reflex, Dead-Stiff Theta, Safe Position Drift)
 reward_weights:
   r_alive: 1.0                  # Thưởng sống sót khi góc đứng thẳng (|theta| < 6 độ)
   w_theta: 35.0                 # ƯU TIÊN SỐ 1: Giữ thân xe tuyệt đối thẳng đứng (|theta| < 0.5 độ)
   w_dtheta: 3.50                # Phanh con lắc góc: Dập tắt dao động nghiêng tức thì
-  w_pos: 0.35                   # Kéo về x = 0 (tăng từ 0.25 để kéo xe về gần 0, không đứng ở 30cm)
-  w_vel: 1.80                   # Cản vận tốc di chuyển: Dập tắt quán tính, chống trôi và chống vọt lố
-  w_action: 0.010               # Phạt công suất tiêu hao
-  w_action_diff: 3.50           # Phạt xung giật để triệt tiêu hoàn toàn dải rung mờ
+  w_pos: 0.15                   # Kéo về x = 0 nhẹ nhàng, an toàn tuyệt đối (không bị trôi trượt)
+  w_vel: 1.30                   # Cản vận tốc di chuyển: Giữ xe đứng yên, không trôi dạt
+  w_action: 0.015               # Phạt công suất tiêu hao
+  w_action_diff: 1.60           # Phạt xung giật nhẹ nhàng, giữ phản xạ nhạy bén cho con lắc
   fall_penalty: 100.0           # Phạt nặng khi ngã
 
 # 5. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3

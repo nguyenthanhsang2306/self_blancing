@@ -136,7 +136,6 @@ class SelfBalancingGymEnv(gym.Env):
         self.enc_x_prev = 0.0
         self.enc_v = 0.0
         self.pos_counter = 0
-        self.dtheta_filt = 0.0
 
         self.u_prev = 0.0
         self.prev_action = 0.0
@@ -151,10 +150,7 @@ class SelfBalancingGymEnv(gym.Env):
         noise_dth = self.rng.normal(0.0, self.gyro_noise_std) if self.dr_enabled else 0.0
 
         meas_theta = self.state[0] + noise_th
-        raw_dtheta = self.state[1] + noise_dth
-        # Bộ lọc đạo hàm LPF (fc ~ 30 Hz) khử sạch nhiễu cảm biến Gyro
-        self.dtheta_filt += 0.65 * (raw_dtheta - self.dtheta_filt)
-        meas_dtheta = self.dtheta_filt
+        meas_dtheta = self.state[1] + noise_dth
         meas_x = self.enc_x
         meas_v = self.enc_v
 
@@ -222,7 +218,6 @@ class SelfBalancingGymEnv(gym.Env):
         self.enc_x_prev = self.enc_x
         self.enc_v = 0.0
         self.pos_counter = 0
-        self.dtheta_filt = 0.0
 
         self.u_prev = 0.0
         self.prev_action = 0.0
@@ -299,8 +294,8 @@ class SelfBalancingGymEnv(gym.Env):
         # Bước 1.1: Hệ số khuếch đại lực kéo PPO boost (1.30)
         u_raw = action_val * self.max_pwm * self.ppo_boost
 
-        # Bước 1.2: Bộ lọc thông thấp LPF 1st-order cân bằng (0.40 raw + 0.60 prev, êm mượt, không rung giật)
-        u_ppo = 0.40 * u_raw + 0.60 * self.u_prev
+        # Bước 1.2: Bộ lọc thông thấp LPF 1st-order phản xạ nhanh (0.60 raw + 0.40 prev)
+        u_ppo = 0.60 * u_raw + 0.40 * self.u_prev
         u_ppo = float(np.clip(u_ppo, -self.max_pwm, self.max_pwm))
         self.u_prev = u_ppo
 
