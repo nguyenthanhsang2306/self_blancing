@@ -93,8 +93,8 @@ Nhằm đảm bảo an toàn tuyệt đối, triệt tiêu nguy cơ bánh xe qua
   - Giai đoạn 1 ($0 \to 80\text{k}$ steps): Góc khởi đầu nhỏ $\theta_0 \in [-1.0^\circ, +1.0^\circ]$.
   - Giai đoạn 2 ($80\text{k} \to 200\text{k}$ steps): Góc khởi đầu mở rộng $\theta_0 \in [-3.0^\circ, +3.0^\circ]$.
   - Giai đoạn 3 ($200\text{k}+$ steps): Góc khởi đầu mở rộng $\theta_0 \in [-5.0^\circ, +5.0^\circ]$, kết hợp tiêm xung lực nhiễu ngẫu nhiên $\pm 0.7\text{ N} \to \pm 2.0\text{ N}$ trong 35% số ván.
-- **Hàm thưởng (Critical Damping & Anti-Oscillation):**
-  $$R_t = R_{\text{alive}} - 40.0 \theta^2 - 5.50 \dot{\theta}^2 - 4.50 (x - x_{\text{ref}})^2 - 4.50 v^2 - 0.020 a_t^2 - 2.50 (a_t - a_{t-1})^2$$
+- **Hàm thưởng (Angle-First, Soft Centering):**
+  $$R_t = R_{\text{alive}} - 35.0 \theta^2 - 3.50 \dot{\theta}^2 - 0.12 (x - x_{\text{ref}})^2 - 1.20 v^2 - 0.015 a_t^2 - 1.50 (a_t - a_{t-1})^2$$
 - **Cơ chế chọn Checkpoint:** `BestCheckpointCallback` tự động đánh giá định kỳ mỗi 20,000 steps trên chùm bài test độc lập và chỉ lưu checkpoint có điểm số cao nhất thành `best_policy.npz`.
 
 ---

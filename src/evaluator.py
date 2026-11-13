@@ -130,20 +130,25 @@ class PolicyEvaluator:
         if survived_runs:
             mean_max_x = float(np.mean([r['max_x'] for r in survived_runs]))
             max_x_worst = float(np.max([r['max_x'] for r in survived_runs]))
+            mean_final_x = float(np.mean([r['final_x'] for r in survived_runs]))
             mean_settle = float(np.mean([r['settling_time'] for r in survived_runs]))
             mean_rms_pwm = float(np.mean([r['rms_pwm'] for r in survived_runs]))
         else:
             mean_max_x = 1.0
             max_x_worst = 1.0
+            mean_final_x = 1.0
             mean_settle = duration
             mean_rms_pwm = 999.0
 
-        # Điểm đánh giá tổng hợp: Ưu tiên không ngã (1000 điểm), trừ điểm vị trí trôi dạt và thời gian ổn định
+        # Điểm đánh giá tổng hợp:
+        # 1. Ưu tiên cao nhất: Không ngã (1000 điểm)
+        # 2. Phạt nặng hiện tượng con lắc võng dao động liên tục không tắt (mean_settle = 10s)
+        # 3. Phạt nếu vị trí cuối cùng không hồi phục về gốc x = 0
         composite_score = (
             (100.0 - fall_rate) * 10.0
-            - 150.0 * mean_max_x
-            - 50.0 * mean_settle
-            - 0.05 * mean_rms_pwm
+            - 80.0 * mean_settle
+            - 100.0 * mean_final_x
+            - 0.10 * mean_rms_pwm
         )
 
         summary = {
@@ -152,6 +157,7 @@ class PolicyEvaluator:
             'fall_rate_pct': fall_rate,
             'mean_max_x_m': mean_max_x,
             'max_x_worst_m': max_x_worst,
+            'mean_final_x_m': mean_final_x,
             'mean_settle_s': mean_settle,
             'mean_rms_pwm': mean_rms_pwm,
             'composite_score': composite_score,
