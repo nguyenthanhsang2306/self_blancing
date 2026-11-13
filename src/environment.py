@@ -95,15 +95,15 @@ class SelfBalancingGymEnv(gym.Env):
         self.imu_noise_std = math.radians(dr.get('imu_noise_std_deg', 0.02))
         self.gyro_noise_std = math.radians(dr.get('gyro_noise_std_dps', 0.20))
 
-        # Hàm thưởng
+        # Hàm thưởng (Critical Damping)
         rw = config.get('reward_weights', {})
         self.r_alive = rw.get('r_alive', 1.0)
-        self.w_theta = rw.get('w_theta', 35.0)
-        self.w_dtheta = rw.get('w_dtheta', 3.50)
-        self.w_pos = rw.get('w_pos', 4.00)
-        self.w_vel = rw.get('w_vel', 2.50)
-        self.w_action = rw.get('w_action', 0.015)
-        self.w_action_diff = rw.get('w_action_diff', 1.20)
+        self.w_theta = rw.get('w_theta', 40.0)
+        self.w_dtheta = rw.get('w_dtheta', 5.50)
+        self.w_pos = rw.get('w_pos', 4.50)
+        self.w_vel = rw.get('w_vel', 4.50)
+        self.w_action = rw.get('w_action', 0.020)
+        self.w_action_diff = rw.get('w_action_diff', 2.50)
         self.fall_penalty = rw.get('fall_penalty', 100.0)
 
         # Observation Space

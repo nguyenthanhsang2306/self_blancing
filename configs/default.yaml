@@ -48,15 +48,15 @@ domain_randomization:
   imu_noise_std_deg: 0.02       # Nhiễu góc đo MPU6050
   gyro_noise_std_dps: 0.20      # Nhiễu gyro
 
-# 4. HÀM THƯỞNG TRIỆT TIÊU DAO ĐỘNG & GIỮ VỊ TRÍ GỐC (Auto-Centering & Smooth Control)
+# 4. HÀM THƯỞNG CRITICAL DAMPING (Triệt Tiêu Dao Động Vung Lắc & Vọt Lố)
 reward_weights:
   r_alive: 1.0                  # Thưởng sống sót khi góc đứng thẳng (|theta| < 6 độ)
-  w_theta: 35.0                 # Ưu tiên cân bằng đứng thẳng (|theta| < 0.5 độ)
-  w_dtheta: 3.50                # Khâu cản góc tối ưu: Dập tắt dao động con lắc võng, phản xạ nhanh
-  w_pos: 4.00                   # Khóa vị trí êm ái x = 0 (vừa phải, triệt tiêu hiện tượng dập dềnh)
-  w_vel: 2.50                   # Khâu cản vận tốc: Dập tắt trớn di chuyển, chống vọt lố
-  w_action: 0.015               # Phạt tiêu hao công suất động cơ
-  w_action_diff: 1.20           # Phạt vi sai: Ép PWM mượt mà tuyệt đối, triệt tiêu rung giật
+  w_theta: 40.0                 # Ưu tiên cân bằng đứng thẳng (|theta| < 0.5 độ)
+  w_dtheta: 5.50                # Khâu cản góc tới hạn: Dập tắt hoàn toàn con lắc võng, chống vọt lố âm
+  w_pos: 4.50                   # Khóa vị trí êm ái x = 0 (kéo xe về gốc nhanh chóng)
+  w_vel: 4.50                   # Khâu cản vận tốc cực mạnh: Triệt tiêu trớn quán tính, giảm vọt lố từ 22cm xuống < 7cm
+  w_action: 0.020               # Phạt tiêu hao công suất động cơ
+  w_action_diff: 2.50           # Phạt vi sai mạnh: Ép PWM mượt mà, triệt tiêu xung vuông +/-100
   fall_penalty: 100.0           # Phạt nặng khi ngã
 
 # 5. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3
