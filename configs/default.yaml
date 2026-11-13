@@ -53,10 +53,10 @@ reward_weights:
   r_alive: 1.0                  # Thưởng sống sót khi góc đứng thẳng (|theta| < 6 độ)
   w_theta: 35.0                 # ƯU TIÊN SỐ 1: Giữ thân xe tuyệt đối thẳng đứng (|theta| < 0.5 độ)
   w_dtheta: 3.50                # Phanh con lắc góc: Dập tắt dao động nghiêng tức thì
-  w_pos: 0.25                   # Kéo về x = 0 êm dịu (gấp đôi 0.12 để không trôi 10s, nhưng không quá lớn gây lắc)
-  w_vel: 1.60                   # Cản vận tốc di chuyển: Dập tắt quán tính, chống trôi và chống vọt lố
+  w_pos: 0.35                   # Kéo về x = 0 (tăng từ 0.25 để kéo xe về gần 0, không đứng ở 30cm)
+  w_vel: 1.80                   # Cản vận tốc di chuyển: Dập tắt quán tính, chống trôi và chống vọt lố
   w_action: 0.010               # Phạt công suất tiêu hao
-  w_action_diff: 2.50           # Phạt xung giật vừa đủ (tránh trễ pha tê liệt phản xạ như mức 8.0)
+  w_action_diff: 3.50           # Phạt xung giật để triệt tiêu hoàn toàn dải rung mờ
   fall_penalty: 100.0           # Phạt nặng khi ngã
 
 # 5. CẤU HÌNH THUẬT TOÁN STABLE-BASELINES3
