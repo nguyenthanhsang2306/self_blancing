@@ -31,7 +31,7 @@ class SelfBalancingGymEnv(gym.Env):
          - Bộ lọc vận tốc đạo hàm bậc 1 với hệ số lọc N = 10 (alpha = 0.1667).
       4. Đường truyền Actuation đồng bộ với motor.c:
          - Hệ số khuếch đại lực kéo PPO: DEFAULT_PPO_BOOST = 1.30.
-         - Bộ lọc LPF hành vi 1st-order: u_ppo = 0.60 * u_raw + 0.40 * u_prev.
+         - Bộ lọc LPF hành vi 1st-order: u_ppo = 0.30 * u_raw + 0.70 * u_prev.
          - Lượng tử hóa số nguyên: lroundf(u_ppo).
          - Bù vùng chết mềm (Soft Deadband Ramp) y hệt motor.c output():
            mag < 15 -> db = deadband * mag / 15; else db = deadband.
@@ -294,8 +294,8 @@ class SelfBalancingGymEnv(gym.Env):
         # Bước 1.1: Hệ số khuếch đại lực kéo PPO boost (1.30)
         u_raw = action_val * self.max_pwm * self.ppo_boost
 
-        # Bước 1.2: Bộ lọc thông thấp LPF 1st-order khử rung nơ-ron (0.60 raw + 0.40 prev)
-        u_ppo = 0.60 * u_raw + 0.40 * self.u_prev
+        # Bước 1.2: Bộ lọc thông thấp LPF 1st-order khử rung nơ-ron (0.30 raw + 0.70 prev, fc ~ 10 Hz)
+        u_ppo = 0.30 * u_raw + 0.70 * self.u_prev
         u_ppo = float(np.clip(u_ppo, -self.max_pwm, self.max_pwm))
         self.u_prev = u_ppo
 
@@ -304,7 +304,7 @@ class SelfBalancingGymEnv(gym.Env):
 
         # Bước 1.4: Bù vùng chết mềm (Soft Deadband Ramp) y hệt hàm output() trong motor.c
         mag = abs(pwm_int)
-        if mag == 0:
+        if mag <= 2:
             firmware_pwm = 0
         else:
             db = (int(self.deadband) * mag) // 15 if mag < 15 else int(self.deadband)
