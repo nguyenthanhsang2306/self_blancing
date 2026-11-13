@@ -36,17 +36,23 @@ class SelfBalancingGymEnv(gym.Env):
          - Bù vùng chết mềm (Soft Deadband Ramp) y hệt motor.c output():
            mag < 15 -> db = deadband * mag / 15; else db = deadband.
          - Mô hình động cơ vật lý phản ứng với vùng chết thực tế 80 PWM.
-      5. Hàm thưởng triệt tiêu dao động hình sin & giữ vị trí gốc x = 0.
+      5. Bộ sinh số ngẫu nhiên độc lập (self.rng) cho từng worker tránh trùng lặp.
+      6. Phân bố góc khởi đầu mở rộng toàn diện (±1°, ±3°, ±5°) và xung nhiễu 2 chiều.
     """
     metadata = {"render_modes": ["human"], "render_fps": 200}
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, env_rank=0, seed=None):
         super().__init__()
 
         if config is None:
             config = {}
 
         self.cfg = config
+        self.env_rank = env_rank
+        # Bộ sinh số ngẫu nhiên riêng cho môi trường này
+        init_seed = seed if seed is not None else (42 + env_rank * 1009)
+        self.rng = np.random.RandomState(init_seed)
+
         p = config.get('robot_physics', {})
         self.M_nom = p.get('M', 0.360)
         self.m = p.get('m', 0.030)
@@ -140,8 +146,8 @@ class SelfBalancingGymEnv(gym.Env):
 
     def _get_meas_state(self):
         """Đo lường góc nghiêng (MPU6050) và vị trí/vận tốc (Encoder 20ms)"""
-        noise_th = np.random.normal(0.0, self.imu_noise_std) if self.dr_enabled else 0.0
-        noise_dth = np.random.normal(0.0, self.gyro_noise_std) if self.dr_enabled else 0.0
+        noise_th = self.rng.normal(0.0, self.imu_noise_std) if self.dr_enabled else 0.0
+        noise_dth = self.rng.normal(0.0, self.gyro_noise_std) if self.dr_enabled else 0.0
 
         meas_theta = self.state[0] + noise_th
         meas_dtheta = self.state[1] + noise_dth
@@ -166,17 +172,17 @@ class SelfBalancingGymEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         if seed is not None:
-            np.random.seed(seed)
+            self.rng = np.random.RandomState(seed)
 
         if options is None:
             options = {}
 
         if self.dr_enabled and 'fixed_physics' not in options:
-            self.M = np.random.uniform(self.mass_range[0], self.mass_range[1])
+            self.M = self.rng.uniform(self.mass_range[0], self.mass_range[1])
             self.J = self.J_nom * (self.M / self.M_nom)
-            self.b = np.random.uniform(self.friction_range[0], self.friction_range[1])
-            self.V_bat = np.random.uniform(self.vbat_range[0], self.vbat_range[1])
-            self.slope_rad = math.radians(np.random.uniform(self.slope_range_deg[0], self.slope_range_deg[1]))
+            self.b = self.rng.uniform(self.friction_range[0], self.friction_range[1])
+            self.V_bat = self.rng.uniform(self.vbat_range[0], self.vbat_range[1])
+            self.slope_rad = math.radians(self.rng.uniform(self.slope_range_deg[0], self.slope_range_deg[1]))
         else:
             self.M = self.M_nom
             self.J = self.J_nom
@@ -186,21 +192,25 @@ class SelfBalancingGymEnv(gym.Env):
 
         self.M_tot = self.M + 1.5 * self.m
 
-        # Curriculum hoặc chỉ định góc ban đầu
+        # Khởi tạo góc ban đầu đa tầng (Curriculum Multi-distribution):
+        # Đảm bảo mô hình được luyện đều ở góc nhỏ ±1°, góc trung bình ±3° và góc lớn ±5°
         if 'init_theta_deg' in options:
             init_theta = math.radians(float(options['init_theta_deg']))
         else:
-            # Mở rộng dần góc khởi đầu theo curriculum
-            if self.total_env_steps < 80000:
-                curriculum_deg = 1.0
-            elif self.total_env_steps < 200000:
-                curriculum_deg = 3.0
+            # Phân bố góc ngẫu nhiên cho từng môi trường:
+            # 40% khởi đầu góc lớn (±3° đến ±5.2°)
+            # 35% khởi đầu góc vừa (±1° đến ±3°)
+            # 25% khởi đầu góc nhỏ (±0.2° đến ±1°)
+            dice = self.rng.rand()
+            if dice < 0.40:
+                max_deg = 5.2
+            elif dice < 0.75:
+                max_deg = 3.0
             else:
-                curriculum_deg = 5.0
-            max_deg = options.get('max_init_deg', curriculum_deg)
-            init_theta = np.random.uniform(-math.radians(max_deg), math.radians(max_deg))
+                max_deg = 1.0
+            init_theta = self.rng.uniform(-math.radians(max_deg), math.radians(max_deg))
 
-        init_x = float(options.get('init_x', np.random.uniform(-0.005, 0.005)))
+        init_x = float(options.get('init_x', self.rng.uniform(-0.005, 0.005)))
         self.state = np.array([init_theta, 0.0, init_x, 0.0], dtype=np.float32)
 
         # Khởi tạo trạng thái Encoder & LPF
@@ -214,15 +224,17 @@ class SelfBalancingGymEnv(gym.Env):
         self.step_count = 0
         self.latency_buffer = [0.0] * len(self.latency_buffer)
 
-        # Lên lịch tạo xung lực nhiễu ngẫu nhiên trong huấn luyện (Curriculum Disturbance)
+        # Lên lịch tạo xung lực nhiễu hai chiều ngẫu nhiên trong lúc train (40% số ván)
         self.episode_kick_step = -1
         self.episode_kick_force = 0.0
         self.episode_kick_len = 0
-        if self.dr_enabled and 'fixed_physics' not in options and np.random.rand() < 0.35:
-            # 35% số ván trong lúc train sẽ có xung lực ngẫu nhiên tác động (0.7N - 2.0N)
-            self.episode_kick_step = np.random.randint(200, 700)
-            self.episode_kick_force = float(np.random.choice([-1.0, 1.0]) * np.random.uniform(0.7, 2.0))
-            self.episode_kick_len = np.random.randint(10, 25)  # Kéo dài 50 ms - 125 ms
+        if self.dr_enabled and 'fixed_physics' not in options and self.rng.rand() < 0.40:
+            # Chọn bước bắt đầu va đập ngẫu nhiên từ t = 1.0s đến 3.5s
+            self.episode_kick_step = self.rng.randint(200, 700)
+            # Lực va đập hai chiều: từ ±0.8N đến ±2.2N
+            kick_dir = self.rng.choice([-1.0, 1.0])
+            self.episode_kick_force = float(kick_dir * self.rng.uniform(0.8, 2.2))
+            self.episode_kick_len = self.rng.randint(10, 25)  # Kéo dài 50 ms - 125 ms
 
         meas_s = self._get_meas_state()
         self.prev_obs = meas_s.copy()

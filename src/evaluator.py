@@ -9,6 +9,7 @@ class PolicyEvaluator:
       - Xung lực nhiễu hai chiều: [0.0N, +1.0N, -1.0N, +2.0N, -2.0N] (tại t = 2.0s - 2.1s)
       - Các mức điện áp pin: [7.2V, 7.4V, 8.4V]
       - Thời gian kiểm tra: 10.0 giây (2000 bước tại Ts = 5 ms)
+      - Sử dụng Seed cố định độc lập (Evaluation Seeds) để đảm bảo tính khách quan và lặp lại 100%.
       - Thu thập chỉ số: Tỷ lệ ngã, Độ lệch vị trí cực đại, Thời gian trở về gốc (Settling time), RMS PWM.
     """
 
@@ -21,11 +22,11 @@ class PolicyEvaluator:
         self.test_vbats = [7.2, 7.4, 8.4]
         self.duration = 10.0
 
-    def evaluate_single_run(self, policy, init_theta_deg, kick_n, vbat_v, duration=10.0):
-        env = SelfBalancingGymEnv(self.config)
+    def evaluate_single_run(self, policy, init_theta_deg, kick_n, vbat_v, duration=10.0, eval_seed=1001):
+        env = SelfBalancingGymEnv(self.config, seed=eval_seed)
         steps = int(duration / env.Ts)
 
-        obs, _ = env.reset(options={
+        obs, _ = env.reset(seed=eval_seed, options={
             'init_theta_deg': init_theta_deg,
             'init_x': 0.0,
             'v_bat': vbat_v,
@@ -95,12 +96,12 @@ class PolicyEvaluator:
 
     def evaluate(self, policy, quick_eval=False):
         """
-        Đánh giá toàn diện ma trận:
-          - quick_eval=True: Dùng trong lúc huấn luyện (12 test case tiêu biểu để chọn checkpoint nhanh)
-          - quick_eval=False: Đánh giá đầy đủ 90 test case
+        Đánh giá độc lập với bộ Seed cố định (Independent Evaluation Suite):
+          - quick_eval=True: Dùng trong lúc huấn luyện (18 test case tiêu biểu để chọn checkpoint nhanh)
+          - quick_eval=False: Đánh giá đầy đủ 90 test case (10 giây mỗi bài)
         """
         if quick_eval:
-            angles = [-5.0, -1.0, 1.0, 5.0]
+            angles = [-5.0, -3.0, -1.0, 1.0, 3.0, 5.0]
             kicks = [0.0, 1.5, -1.5]
             vbats = [7.4]
             duration = 6.0
@@ -111,10 +112,14 @@ class PolicyEvaluator:
             duration = self.duration
 
         results = []
+        test_case_id = 0
         for v in vbats:
             for k in kicks:
                 for th in angles:
-                    res = self.evaluate_single_run(policy, th, k, v, duration=duration)
+                    test_case_id += 1
+                    # Seed cố định riêng cho từng kịch bản đánh giá
+                    case_seed = 5000 + test_case_id
+                    res = self.evaluate_single_run(policy, th, k, v, duration=duration, eval_seed=case_seed)
                     results.append(res)
 
         total_runs = len(results)
@@ -159,7 +164,7 @@ class PolicyEvaluator:
         r = summary
         lines = []
         lines.append("### BÁO CÁO ĐÁNH GIÁ ĐỘC LẬP CHÙM BÀI TEST TOÀN DIỆN")
-        lines.append(f"- **Tổng số ca kiểm thử:** {r['total_runs']} kịch bản (Thời gian mỗi bài: {self.duration:.1f}s)")
+        lines.append(f"- **Tổng số ca kiểm thử:** {r['total_runs']} kịch bản (Thời gian mỗi bài: {self.duration:.1f}s, Seed đánh giá cố định)")
         lines.append(f"- **Tỷ lệ ngã (Fall Rate):** {r['fall_rate_pct']:.1f}% ({r['fall_count']}/{r['total_runs']} bài ngã)")
         lines.append(f"- **Độ lệch vị trí trung bình:** {r['mean_max_x_m']*100:.2f} cm (Xấu nhất: {r['max_x_worst_m']*100:.2f} cm)")
         lines.append(f"- **Thời gian trở về gốc trung bình:** {r['mean_settle_s']:.2f} s")
@@ -168,7 +173,7 @@ class PolicyEvaluator:
         lines.append("\n| Góc khởi đầu | Xung nhiễu (N) | Pin (V) | Sống sót (s) | Max Theta | Max X (cm) | Settling (s) | RMS PWM |")
         lines.append("|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
 
-        # In mẫu một số kịch bản tiêu biểu
+        # In mẫu các kịch bản tiêu biểu ở mức pin danh định 7.4V
         sample_results = [res for res in r['detailed_results'] if res['vbat'] == 7.4]
         for res in sample_results:
             status = f"{res['survive_time']:.1f}s" if not res['fallen'] else f"NGÃ ({res['survive_time']:.2f}s)"

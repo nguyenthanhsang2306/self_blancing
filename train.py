@@ -9,6 +9,11 @@ from src.environment import SelfBalancingGymEnv
 from src.models import NumpyMLPPolicy
 from src.evaluator import PolicyEvaluator
 
+def make_env_fn(config, env_rank, base_seed):
+    def _init():
+        return SelfBalancingGymEnv(config, env_rank=env_rank, seed=base_seed + env_rank * 1009)
+    return _init
+
 def train():
     parser = argparse.ArgumentParser(description="Train RL Self-Balancing Robot via Stable-Baselines3 (PPO)")
     parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to default.yaml")
@@ -24,14 +29,14 @@ def train():
 
     print("==============================================================================")
     print("      REINFORCEMENT LEARNING FOR SELF-BALANCING ROBOT (SB3 PPO + STM32)      ")
-    print("      Curriculum: Angle (1° -> 3° -> 5°) + Impulse Disturbance Training        ")
+    print("      Curriculum: Full Range (±1°, ±3°, ±5°) + Bidirectional Kicks             ")
     print("      Target Hardware: STM32L476RG (Cortex-M4 @ 80MHz with FPU)                ")
     print("==============================================================================")
 
     seed = config['system']['seed']
     set_seed(seed)
 
-    env = SelfBalancingGymEnv(config)
+    env = SelfBalancingGymEnv(config, env_rank=0, seed=seed)
     obs_dim = env.observation_space.shape[0]
     print(f"[Env] Observation space dimension: {obs_dim}D ({config['gym_env'].get('obs_mode', '9d')})")
     print(f"[Env] Action space:                {env.action_space}")
@@ -56,7 +61,7 @@ def train():
     try:
         import torch
         from stable_baselines3 import PPO
-        from stable_baselines3.common.env_util import make_vec_env
+        from stable_baselines3.common.vec_env import DummyVecEnv
         from stable_baselines3.common.callbacks import BaseCallback
     except ImportError as e:
         print("\n" + "=" * 78)
@@ -79,8 +84,10 @@ def train():
 
     n_envs = rl_cfg.get('n_envs', 8)
     try:
-        train_env = make_vec_env(lambda: SelfBalancingGymEnv(config), n_envs=n_envs)
-        print(f"[Parallel] Kích hoạt Vectorized Environment với {n_envs} môi trường song song (Tăng tốc gấp 8 lần)!")
+        # Khởi tạo từng môi trường với seed và RandomState độc lập
+        env_fns = [make_env_fn(config, i, seed) for i in range(n_envs)]
+        train_env = DummyVecEnv(env_fns)
+        print(f"[Parallel] Kích hoạt Vectorized Environment với {n_envs} môi trường song song (Độc lập RNG, Tăng tốc 8x)!")
     except Exception as env_err:
         print(f"[Notice] Sử dụng môi trường đơn do: {env_err}")
         train_env = env
@@ -100,13 +107,14 @@ def train():
         verbose=1
     )
 
-    # Callback chọn Checkpoint xuất sắc nhất dựa trên bài kiểm tra độc lập
+    # Callback đánh giá độc lập để chọn Checkpoint xuất sắc nhất
     class BestCheckpointCallback(BaseCallback):
         def __init__(self, eval_freq=20000, verbose=1):
             super().__init__(verbose)
-            self.eval_freq = eval_freq // n_envs
+            self.eval_freq = max(1, eval_freq // n_envs)
             self.best_score = -float('inf')
             self.best_step = 0
+            self.best_fall_rate = 100.0
 
         def _on_step(self) -> bool:
             if self.n_calls % self.eval_freq == 0:
@@ -121,26 +129,16 @@ def train():
                 if score > self.best_score:
                     self.best_score = score
                     self.best_step = self.num_timesteps
+                    self.best_fall_rate = fall_rate
 
-                    # Lưu best_policy.npz
+                    # Chỉ lưu model tốt nhất vào best_policy.npz
                     ckpt_dir = config['export']['checkpoint_dir']
                     os.makedirs(ckpt_dir, exist_ok=True)
                     npz_path = os.path.join(ckpt_dir, "best_policy.npz")
                     numpy_policy.save_weights(npz_path)
 
-                    # Xuất C Header
-                    hdr_dir = config['export']['header_output_dir']
-                    hdr_name = config['export'].get('header_filename', 'rl_sb3_stm32.h')
-                    hdr_path = os.path.join(hdr_dir, hdr_name)
-                    export_sb3_c_header(numpy_policy, hdr_path)
-
-                    # Đồng bộ sang Project_self/Core/Inc
-                    stm32_inc = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Project_self", "Core", "Inc", hdr_name))
-                    if os.path.isdir(os.path.dirname(stm32_inc)):
-                        export_sb3_c_header(numpy_policy, stm32_inc)
-
                     if self.verbose > 0:
-                        print(f"  >>> [CHECKPOINT XUẤT SẮC] Đã lưu model tại step {self.num_timesteps} vào best_policy.npz & rl_sb3_stm32.h (Điểm={score:.1f})!\n")
+                        print(f"  >>> [NEW BEST CHECKPOINT] Đã cập nhật best_policy.npz tại step {self.num_timesteps} (Điểm={score:.1f}, Ngã={fall_rate:.1f}%)!\n")
 
             return True
 
@@ -151,20 +149,31 @@ def train():
 
     ckpt_dir = config['export']['checkpoint_dir']
     os.makedirs(ckpt_dir, exist_ok=True)
-    sb3_save_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_balancing_robot.zip")
-    model.save(sb3_save_path)
-    print(f"\n[Checkpoint] Đã lưu model SB3 cuối sang: {sb3_save_path}")
+    # Lưu model cuối cùng vào final_policy (không ghi đè best_policy!)
+    final_sb3_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_final_model.zip")
+    model.save(final_sb3_path)
+    final_npz_path = os.path.join(ckpt_dir, "final_policy.npz")
+    numpy_policy.load_from_sb3(model)
+    numpy_policy.save_weights(final_npz_path)
+    print(f"\n[Checkpoint] Đã lưu model cuối đợt train sang: {final_npz_path}")
 
-    # Đảm bảo nạp lại checkpoint có kết quả đánh giá tốt nhất (best_policy.npz)
+    # ĐẢM BẢO CHỈ XUẤT C HEADER TỪ CHECKPOINT XUẤT SẮC NHẤT
     best_npz_path = os.path.join(ckpt_dir, "best_policy.npz")
     if os.path.exists(best_npz_path):
         numpy_policy.load_weights(best_npz_path)
-        print(f"[Final] Đã nạp lại checkpoint xuất sắc nhất từ: {best_npz_path}")
+        print(f"[Final Selection] Đã chọn Checkpoint xuất sắc nhất từ: {best_npz_path}")
     else:
-        numpy_policy.load_from_sb3(model)
-        numpy_policy.save_weights(best_npz_path)
+        print("[Notice] Sử dụng final model vì chưa có best_policy.npz")
 
-    # Xuất file C Header cuối cùng
+    # Đánh giá độc lập toàn diện 90 kịch bản trên Checkpoint tốt nhất
+    print("\n" + "=" * 78)
+    print("      ĐÁNH GIÁ ĐỘC LẬP TOÀN DIỆN TRÊN CHECKPOINT XUẤT SẮC NHẤT (90 BÀI TEST) ")
+    print("=" * 78)
+    summary = evaluator.evaluate(numpy_policy, quick_eval=False)
+    report = evaluator.format_report(summary)
+    print("\n" + report + "\n")
+
+    # XUẤT C HEADER SAU KHI ĐÃ ĐÁNH GIÁ VÀ XÁC NHẬN CHẤT LƯỢNG
     hdr_dir = config['export']['header_output_dir']
     hdr_name = config['export'].get('header_filename', 'rl_sb3_stm32.h')
     hdr_path = os.path.join(hdr_dir, hdr_name)
@@ -174,14 +183,6 @@ def train():
     if os.path.isdir(os.path.dirname(stm32_inc)):
         export_sb3_c_header(numpy_policy, stm32_inc)
         print(f"[Sync] Đã đồng bộ trực tiếp file C Header sang STM32 Project: {stm32_inc}")
-
-    # Chạy ma trận đánh giá độc lập toàn diện 90 kịch bản trên Checkpoint tốt nhất
-    print("\n" + "=" * 78)
-    print("      ĐÁNH GIÁ ĐỘC LẬP TOÀN DIỆN TRÊN CHECKPOINT XUẤT SẮC NHẤT               ")
-    print("=" * 78)
-    summary = evaluator.evaluate(numpy_policy, quick_eval=False)
-    report = evaluator.format_report(summary)
-    print("\n" + report + "\n")
 
     print("[Done] Huấn luyện, đánh giá độc lập và xuất mô hình hoàn tất 100%!")
 
