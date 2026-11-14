@@ -51,6 +51,7 @@ domain_randomization:
 # 4. HÀM THƯỞNG CÂN BẰNG PHẢN XẠ NHANH (Fast Reflex, Dead-Stiff Theta, Safe Position Drift)
 reward_weights:
   r_alive: 1.0                  # Thưởng sống sót khi góc đứng thẳng (|theta| < 6 độ)
+  r_hold_bonus: 0.0             # Tắt thưởng nhị phân vùng giữ vị trí (trở về hàm thưởng mốc)
   w_theta: 35.0                 # ƯU TIÊN SỐ 1: Giữ thân xe tuyệt đối thẳng đứng (|theta| < 0.5 độ)
   w_dtheta: 3.50                # Phanh con lắc góc: Dập tắt dao động nghiêng tức thì
   w_pos: 0.15                   # Kéo về x = 0 nhẹ nhàng, an toàn tuyệt đối (không bị trôi trượt)
@@ -63,6 +64,7 @@ reward_weights:
 rl_training:
   algorithm: "PPO"
   net_arch: [64, 64]
+  odd_symmetric: true           # Ràng buộc đối xứng lẻ 0.5*(pi(obs)-pi(-obs)) để triệt lệch tâm
   n_envs: 8                     # Huấn luyện song song 8 môi trường (Tăng tốc gấp 8 lần, mất ~1-2 phút)
   total_timesteps: 400000       # 400,000 bước huấn luyện hội tụ theo curriculum
   learning_rate: 0.0003

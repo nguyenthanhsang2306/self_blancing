@@ -7,12 +7,14 @@ class NumpyMLPPolicy:
       - Tầng 1: Linear(input_dim -> 64) + Tanh
       - Tầng 2: Linear(64 -> 64) + Tanh
       - Tầng 3: Linear(64 -> 1) + Clip([-1.0, 1.0])
-    Hỗ trợ vector quan sát 9D [s_t, s_{t-1}, a_{t-1}] hoặc 4D [s_t].
+    Hỗ trợ vector quan sát 9D [s_t, s_{t-1}, a_{t-1}] hoặc 4D [s_t]
+    và chế độ đối xứng lẻ odd_symmetric: a = 0.5 * (pi(obs) - pi(-obs)).
     """
-    def __init__(self, input_dim=9, hidden_dims=(64, 64), output_dim=1):
+    def __init__(self, input_dim=9, hidden_dims=(64, 64), output_dim=1, odd_symmetric=False):
         self.input_dim = input_dim
         self.h1_dim, self.h2_dim = hidden_dims
         self.output_dim = output_dim
+        self.odd_symmetric = bool(odd_symmetric)
 
         # Khởi tạo ma trận trọng số (Xavier)
         self.w1 = np.random.randn(self.h1_dim, self.input_dim).astype(np.float32) * np.sqrt(2.0 / (input_dim + self.h1_dim))
@@ -24,22 +26,26 @@ class NumpyMLPPolicy:
         self.w3 = np.random.randn(self.output_dim, self.h2_dim).astype(np.float32) * np.sqrt(2.0 / (self.h2_dim + self.output_dim))
         self.b3 = np.zeros(self.output_dim, dtype=np.float32)
 
-    def forward(self, obs):
-        """
-        Lan truyền tiến actor PPO: Tanh -> Tanh -> Linear -> Clip([-1.0, 1.0]).
-        Đồng nhất 100% với model.predict(obs, deterministic=True) của Stable-Baselines3.
-        """
-        x = np.asarray(obs, dtype=np.float32).flatten()
+    def _forward_raw_single(self, x):
         # Tầng ẩn 1: Linear + Tanh
         h1 = np.tanh(np.dot(self.w1, x) + self.b1)
         # Tầng ẩn 2: Linear + Tanh
         h2 = np.tanh(np.dot(self.w2, h1) + self.b2)
         # Tầng đầu ra: Linear + Bão hòa [-1.0, 1.0]
         out = np.dot(self.w3, h2) + self.b3
-        action = float(np.clip(out[0], -1.0, 1.0))
-        return action
+        return float(np.clip(out[0], -1.0, 1.0))
 
-    def load_from_sb3(self, model):
+    def forward(self, obs):
+        """
+        Lan truyền tiến actor PPO: Tanh -> Tanh -> Linear -> Clip([-1.0, 1.0]).
+        Khi odd_symmetric=True, tính 0.5 * (pi(obs) - pi(-obs)) để triệt tiêu lệch tâm tại obs = 0.
+        """
+        x = np.asarray(obs, dtype=np.float32).flatten()
+        if self.odd_symmetric:
+            return 0.5 * (self._forward_raw_single(x) - self._forward_raw_single(-x))
+        return self._forward_raw_single(x)
+
+    def load_from_sb3(self, model, odd_symmetric=None):
         """Trích xuất và kiểm tra tính toàn vẹn của trọng số từ mô hình Stable-Baselines3 PPO."""
         try:
             policy_net = model.policy.mlp_extractor.policy_net
@@ -72,15 +78,30 @@ class NumpyMLPPolicy:
             self.b2 = b2
             self.w3 = w3
             self.b3 = b3
+            if odd_symmetric is not None:
+                self.odd_symmetric = bool(odd_symmetric)
 
-            print(f"[Model] Trích xuất thành công: input_dim={self.input_dim}, h1={self.w1.shape[0]}, h2={self.w2.shape[0]}")
+            print(
+                f"[Model] Trích xuất thành công: input_dim={self.input_dim}, "
+                f"h1={self.w1.shape[0]}, h2={self.w2.shape[0]}, odd_symmetric={self.odd_symmetric}"
+            )
             return True
         except Exception as e:
             print(f"[Error] Lỗi trích xuất SB3: {e}")
             return False
 
     def save_weights(self, path):
-        np.savez(path, w1=self.w1, b1=self.b1, w2=self.w2, b2=self.b2, w3=self.w3, b3=self.b3, input_dim=self.input_dim)
+        np.savez(
+            path,
+            w1=self.w1,
+            b1=self.b1,
+            w2=self.w2,
+            b2=self.b2,
+            w3=self.w3,
+            b3=self.b3,
+            input_dim=self.input_dim,
+            odd_symmetric=np.bool_(self.odd_symmetric),
+        )
 
     def load_weights(self, path):
         data = np.load(path, allow_pickle=True)
@@ -95,6 +116,7 @@ class NumpyMLPPolicy:
                 self.input_dim = int(data['input_dim'])
             else:
                 self.input_dim = self.w1.shape[1]
+            self.odd_symmetric = bool(data['odd_symmetric']) if 'odd_symmetric' in data else False
         else:
             d = data.item()
             self.w1 = d['w1']
@@ -104,3 +126,4 @@ class NumpyMLPPolicy:
             self.w3 = d['w3']
             self.b3 = d['b3']
             self.input_dim = self.w1.shape[1]
+            self.odd_symmetric = bool(d.get('odd_symmetric', False))

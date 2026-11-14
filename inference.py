@@ -10,13 +10,17 @@ from src.environment import SelfBalancingGymEnv
 from src.models import NumpyMLPPolicy
 from src.evaluator import PolicyEvaluator
 
-def _load_policy(ckpt_path, obs_dim, net_arch, allow_random=False):
+def _load_policy(ckpt_path, obs_dim, net_arch, allow_random=False, force_symmetric=False):
     policy = NumpyMLPPolicy(input_dim=obs_dim, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
     if os.path.exists(ckpt_path):
         policy.load_weights(ckpt_path)
-        print(f"[Model] Đã nạp thành công weights từ: {ckpt_path} (input_dim={policy.input_dim})")
+        if force_symmetric:
+            policy.odd_symmetric = True
+        print(f"[Model] Đã nạp thành công weights từ: {ckpt_path} (input_dim={policy.input_dim}, odd_symmetric={policy.odd_symmetric})")
     elif allow_random:
-        print("[Warning] Chạy với trọng số ngẫu nhiên (--allow-random).")
+        if force_symmetric:
+            policy.odd_symmetric = True
+        print(f"[Warning] Chạy với trọng số ngẫu nhiên (--allow-random, odd_symmetric={policy.odd_symmetric}).")
     else:
         sys.exit(f"[Error] Không tìm thấy checkpoint: {ckpt_path}. Vui lòng huấn luyện hoặc chỉ định --weights.")
     return policy
@@ -35,6 +39,7 @@ def run_inference():
     parser.add_argument("--angle", type=float, default=None, help="Specific initial pitch angle in degrees (e.g. -3.0 or +5.0)")
     parser.add_argument("--duration", type=float, default=10.0, help="Simulation duration in seconds (default: 10.0s)")
     parser.add_argument("--eval-matrix", action="store_true", help="Run full evaluation matrix across angles, kicks, battery levels, and 20-30s drift tests")
+    parser.add_argument("--symmetric", action="store_true", help="Force odd-symmetric inference 0.5*(pi(obs)-pi(-obs)) for loaded weights")
     parser.add_argument("--allow-random", action="store_true", help="Allow running with uninitialized random weights")
     args = parser.parse_args()
 
@@ -57,7 +62,7 @@ def run_inference():
         print("==============================================================================")
         compared = []
         for path in args.compare:
-            pol = _load_policy(path, obs_dim, net_arch, allow_random=False)
+            pol = _load_policy(path, obs_dim, net_arch, allow_random=False, force_symmetric=args.symmetric)
             summ = evaluator.evaluate(pol, quick_eval=False)
             compared.append((path, pol, summ))
 
@@ -189,7 +194,7 @@ def run_inference():
         return
 
     ckpt_path = args.weights if args.weights is not None else os.path.join(config['export']['checkpoint_dir'], "best_policy.npz")
-    policy = _load_policy(ckpt_path, obs_dim, net_arch, allow_random=args.allow_random)
+    policy = _load_policy(ckpt_path, obs_dim, net_arch, allow_random=args.allow_random, force_symmetric=args.symmetric)
 
     if args.eval_matrix:
         print("==============================================================================")

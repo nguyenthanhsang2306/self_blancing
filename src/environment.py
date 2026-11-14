@@ -99,7 +99,7 @@ class SelfBalancingGymEnv(gym.Env):
         # Hàm thưởng (Angle-First, Soft Centering)
         rw = config.get('reward_weights', {})
         self.r_alive = rw.get('r_alive', 1.0)
-        self.r_hold_bonus = float(rw.get('r_hold_bonus', 0.05))
+        self.r_hold_bonus = float(rw.get('r_hold_bonus', 0.0))
         self.w_theta = rw.get('w_theta', 35.0)
         self.w_dtheta = rw.get('w_dtheta', 3.50)
         self.w_pos = rw.get('w_pos', 0.12)

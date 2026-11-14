@@ -23,6 +23,10 @@ def train():
     parser.add_argument("--recenter-prob", type=float, default=None, help="Override gym_env.recenter_init_prob (e.g. 0.0 to disable, 0.30 for 30%%)")
     parser.add_argument("--tag", type=str, default=None, help="Optional suffix tag for checkpoint and header outputs")
     parser.add_argument("--top-k", type=int, default=3, help="Number of top quick-eval checkpoints to keep for Stage-2 22-case screening")
+    sym_group = parser.add_mutually_exclusive_group()
+    sym_group.add_argument("--symmetric", dest="odd_symmetric", action="store_true", help="Enable odd-symmetric actor 0.5*(pi(obs)-pi(-obs))")
+    sym_group.add_argument("--no-symmetric", dest="odd_symmetric", action="store_false", help="Disable odd-symmetric actor")
+    parser.set_defaults(odd_symmetric=None)
     parser.add_argument("--deploy-gate", type=str, default="real_robot", choices=["real_robot", "no_kick", "all"], help="Gate criteria before updating canonical best_policy.npz / STM32 header")
     parser.add_argument("--update-stm32-header", action="store_true", help="Explicitly sync canonical STM32 header (still blocked unless deploy gate passes and untagged)")
     parser.add_argument("--demo-sample", action="store_true", help="Generate mock weights for testing without training")
@@ -63,8 +67,15 @@ def train():
     total_timesteps = args.timesteps if args.timesteps is not None else rl_cfg['total_timesteps']
     algo_name = rl_cfg.get('algorithm', 'PPO').upper()
     net_arch = rl_cfg.get('net_arch', [64, 64])
+    use_odd_sym = bool(rl_cfg.get('odd_symmetric', False)) if args.odd_symmetric is None else bool(args.odd_symmetric)
+    print(f"[Policy Mode] odd_symmetric = {use_odd_sym} | r_hold_bonus = {config.get('reward_weights', {}).get('r_hold_bonus', 0.0)}")
 
-    numpy_policy = NumpyMLPPolicy(input_dim=obs_dim, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
+    numpy_policy = NumpyMLPPolicy(
+        input_dim=obs_dim,
+        hidden_dims=(net_arch[0], net_arch[1]),
+        output_dim=1,
+        odd_symmetric=use_odd_sym,
+    )
     evaluator = PolicyEvaluator(config)
 
     if args.demo_sample:
@@ -81,6 +92,7 @@ def train():
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import DummyVecEnv
         from stable_baselines3.common.callbacks import BaseCallback
+        from stable_baselines3.common.policies import ActorCriticPolicy
     except ImportError as e:
         print("\n" + "=" * 78)
         print("[ERROR] Thiếu thư viện huấn luyện Reinforcement Learning:")
@@ -94,11 +106,41 @@ def train():
     if algo_name != 'PPO':
         sys.exit(f"[Error] Thuật toán '{algo_name}' không được hỗ trợ trong pipeline xuất C trực tiếp. Vui lòng chọn 'PPO'.")
 
-    print(f"[Training] Khởi tạo PPO với kiến trúc actor Tanh: [{obs_dim} -> {net_arch[0]} (Tanh) -> {net_arch[1]} (Tanh) -> 1 (Linear)]...")
+    print(f"[Training] Khởi tạo PPO với kiến trúc actor Tanh: [{obs_dim} -> {net_arch[0]} (Tanh) -> {net_arch[1]} (Tanh) -> 1 (Linear)] (odd_symmetric={use_odd_sym})...")
     policy_kwargs = dict(
         activation_fn=torch.nn.Tanh,
         net_arch=dict(pi=net_arch, vf=net_arch)
     )
+
+    if use_odd_sym:
+        class _OddSymmetricExtractorWrapper(torch.nn.Module):
+            def __init__(self, base_extractor):
+                super().__init__()
+                self.policy_net = base_extractor.policy_net
+                self.value_net = base_extractor.value_net
+                self.latent_dim_pi = base_extractor.latent_dim_pi
+                self.latent_dim_vf = base_extractor.latent_dim_vf
+
+            def forward_actor(self, features):
+                return 0.5 * (self.policy_net(features) - self.policy_net(-features))
+
+            def forward_critic(self, features):
+                return self.value_net(features)
+
+            def forward(self, features):
+                return self.forward_actor(features), self.forward_critic(features)
+
+        class OddSymmetricActorCriticPolicy(ActorCriticPolicy):
+            def _build(self, lr_schedule):
+                super()._build(lr_schedule)
+                self.mlp_extractor = _OddSymmetricExtractorWrapper(self.mlp_extractor)
+                with torch.no_grad():
+                    self.action_net.bias.zero_()
+                self.action_net.bias.requires_grad_(False)
+
+        policy_cls = OddSymmetricActorCriticPolicy
+    else:
+        policy_cls = "MlpPolicy"
 
     n_envs = rl_cfg.get('n_envs', 8)
     try:
@@ -113,7 +155,7 @@ def train():
     n_steps_per_env = max(256, int(2048 / n_envs)) if n_envs > 1 else 2048
 
     model = PPO(
-        "MlpPolicy",
+        policy_cls,
         train_env,
         learning_rate=rl_cfg.get('learning_rate', 0.0003),
         gamma=rl_cfg.get('gamma', 0.99),
@@ -124,6 +166,20 @@ def train():
         seed=seed,
         verbose=1
     )
+
+    # Kiểm tra nhanh tính đối xứng lẻ & đồng nhất SB3 <-> Numpy ngay trước khi train
+    numpy_policy.load_from_sb3(model, odd_symmetric=use_odd_sym)
+    if use_odd_sym:
+        zero_obs = np.zeros(obs_dim, dtype=np.float32)
+        probe_obs = np.linspace(-0.08, 0.08, obs_dim, dtype=np.float32)
+        sb3_zero = float(np.asarray(model.predict(zero_obs, deterministic=True)[0]).item())
+        sb3_pos = float(np.asarray(model.predict(probe_obs, deterministic=True)[0]).item())
+        sb3_neg = float(np.asarray(model.predict(-probe_obs, deterministic=True)[0]).item())
+        np_pos = numpy_policy.forward(probe_obs)
+        assert abs(sb3_zero) < 1e-6, f"Odd-symmetry check failed at 0: {sb3_zero}"
+        assert abs(sb3_pos + sb3_neg) < 1e-6, f"Odd-symmetry check failed: {sb3_pos} vs {sb3_neg}"
+        assert abs(sb3_pos - np_pos) < 1e-5, f"SB3 vs Numpy parity failed: {sb3_pos} vs {np_pos}"
+        print(f"[Symmetry Verified] SB3 f(0)={sb3_zero:+.2e}, f(x)+f(-x)={sb3_pos+sb3_neg:+.2e}, |SB3-Numpy|={abs(sb3_pos-np_pos):.2e}")
 
     ckpt_dir = config['export']['checkpoint_dir']
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -159,7 +215,7 @@ def train():
 
         def _on_step(self) -> bool:
             if self.n_calls % self.eval_freq == 0:
-                numpy_policy.load_from_sb3(self.model)
+                numpy_policy.load_from_sb3(self.model, odd_symmetric=use_odd_sym)
                 summary = evaluator.evaluate(numpy_policy, quick_eval=True)
                 rank_key = (summary['ranking_key'], self.num_timesteps)
 
@@ -204,7 +260,7 @@ def train():
     # Lưu checkpoint cuối đợt train vào final_policy
     final_step = int(model.num_timesteps)
     model.save(final_sb3_path)
-    numpy_policy.load_from_sb3(model)
+    numpy_policy.load_from_sb3(model, odd_symmetric=use_odd_sym)
     numpy_policy.save_weights(final_npz_path)
     print(f"\n[Checkpoint] Đã lưu model cuối đợt train (step {final_step}) sang: {final_npz_path}")
 
