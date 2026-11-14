@@ -26,14 +26,18 @@ class NumpyMLPPolicy:
         self.w3 = np.random.randn(self.output_dim, self.h2_dim).astype(np.float32) * np.sqrt(2.0 / (self.h2_dim + self.output_dim))
         self.b3 = np.zeros(self.output_dim, dtype=np.float32)
 
-    def _forward_raw_single(self, x):
+    def _forward_unclipped_single(self, x):
+        x_arr = np.asarray(x, dtype=np.float32).flatten()
         # Tầng ẩn 1: Linear + Tanh
-        h1 = np.tanh(np.dot(self.w1, x) + self.b1)
+        h1 = np.tanh(np.dot(self.w1, x_arr) + self.b1)
         # Tầng ẩn 2: Linear + Tanh
         h2 = np.tanh(np.dot(self.w2, h1) + self.b2)
-        # Tầng đầu ra: Linear + Bão hòa [-1.0, 1.0]
+        # Tầng đầu ra: Linear (chưa bão hòa)
         out = np.dot(self.w3, h2) + self.b3
-        return float(np.clip(out[0], -1.0, 1.0))
+        return float(out[0])
+
+    def _forward_raw_single(self, x):
+        return float(np.clip(self._forward_unclipped_single(x), -1.0, 1.0))
 
     def forward(self, obs):
         """
@@ -127,3 +131,54 @@ class NumpyMLPPolicy:
             self.b3 = d['b3']
             self.input_dim = self.w1.shape[1]
             self.odd_symmetric = bool(d.get('odd_symmetric', False))
+
+
+try:
+    import torch as _torch
+    from stable_baselines3.common.policies import ActorCriticPolicy as _SB3ActorCriticPolicy
+
+    class OddSymmetricActorCriticPolicy(_SB3ActorCriticPolicy):
+        """
+        Actor đối xứng lẻ cho SB3 PPO với vị trí chặn [-1, 1] từng nhánh trước khi lấy hiệu:
+            a(obs) = 0.5 * (clamp(raw(obs), -1, 1) - clamp(raw(-obs), -1, 1))
+        Đồng nhất 100% giữa PyTorch (SB3), NumPy và C ở cả vùng tuyến tính lẫn khi một nhánh chạm trần.
+        Critic V(obs) giữ nguyên theo value_net chuẩn.
+        """
+
+        def _extract_pi_vf_features(self, obs):
+            features = self.extract_features(obs)
+            if isinstance(features, tuple):
+                return features
+            return features, features
+
+        def _odd_sym_distribution(self, pi_features):
+            raw_pos = _torch.clamp(self.action_net(self.mlp_extractor.forward_actor(pi_features)), -1.0, 1.0)
+            raw_neg = _torch.clamp(self.action_net(self.mlp_extractor.forward_actor(-pi_features)), -1.0, 1.0)
+            mean_actions = 0.5 * (raw_pos - raw_neg)
+            return self.action_dist.proba_distribution(mean_actions, self.log_std)
+
+        def forward(self, obs, deterministic=False):
+            pi_features, vf_features = self._extract_pi_vf_features(obs)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+            values = self.value_net(latent_vf)
+            distribution = self._odd_sym_distribution(pi_features)
+            actions = distribution.get_actions(deterministic=deterministic)
+            log_prob = distribution.log_prob(actions)
+            actions = actions.reshape((-1, *self.action_space.shape))
+            return actions, values, log_prob
+
+        def get_distribution(self, obs):
+            pi_features, _ = self._extract_pi_vf_features(obs)
+            return self._odd_sym_distribution(pi_features)
+
+        def evaluate_actions(self, obs, actions):
+            pi_features, vf_features = self._extract_pi_vf_features(obs)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+            distribution = self._odd_sym_distribution(pi_features)
+            log_prob = distribution.log_prob(actions)
+            values = self.value_net(latent_vf)
+            entropy = distribution.entropy()
+            return values, log_prob, entropy
+
+except ImportError:
+    OddSymmetricActorCriticPolicy = None

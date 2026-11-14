@@ -1,5 +1,6 @@
 import os
 import sys
+import copy
 import glob
 import argparse
 import yaml
@@ -7,8 +8,13 @@ import numpy as np
 
 from src.utils import set_seed, export_sb3_c_header
 from src.environment import SelfBalancingGymEnv
-from src.models import NumpyMLPPolicy
+from src.models import NumpyMLPPolicy, OddSymmetricActorCriticPolicy
 from src.evaluator import PolicyEvaluator
+from verify_export import (
+    verify_policy_parity,
+    find_one_branch_saturation_vectors,
+    simulate_c_inference,
+)
 
 def make_env_fn(config, env_rank, base_seed):
     def _init():
@@ -92,7 +98,6 @@ def train():
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import DummyVecEnv
         from stable_baselines3.common.callbacks import BaseCallback
-        from stable_baselines3.common.policies import ActorCriticPolicy
     except ImportError as e:
         print("\n" + "=" * 78)
         print("[ERROR] Thiếu thư viện huấn luyện Reinforcement Learning:")
@@ -113,31 +118,8 @@ def train():
     )
 
     if use_odd_sym:
-        class _OddSymmetricExtractorWrapper(torch.nn.Module):
-            def __init__(self, base_extractor):
-                super().__init__()
-                self.policy_net = base_extractor.policy_net
-                self.value_net = base_extractor.value_net
-                self.latent_dim_pi = base_extractor.latent_dim_pi
-                self.latent_dim_vf = base_extractor.latent_dim_vf
-
-            def forward_actor(self, features):
-                return 0.5 * (self.policy_net(features) - self.policy_net(-features))
-
-            def forward_critic(self, features):
-                return self.value_net(features)
-
-            def forward(self, features):
-                return self.forward_actor(features), self.forward_critic(features)
-
-        class OddSymmetricActorCriticPolicy(ActorCriticPolicy):
-            def _build(self, lr_schedule):
-                super()._build(lr_schedule)
-                self.mlp_extractor = _OddSymmetricExtractorWrapper(self.mlp_extractor)
-                with torch.no_grad():
-                    self.action_net.bias.zero_()
-                self.action_net.bias.requires_grad_(False)
-
+        if OddSymmetricActorCriticPolicy is None:
+            sys.exit("[Error] OddSymmetricActorCriticPolicy không khả dụng.")
         policy_cls = OddSymmetricActorCriticPolicy
     else:
         policy_cls = "MlpPolicy"
@@ -167,7 +149,7 @@ def train():
         verbose=1
     )
 
-    # Kiểm tra nhanh tính đối xứng lẻ & đồng nhất SB3 <-> Numpy ngay trước khi train
+    # Kiểm tra nhanh tính đối xứng lẻ & đồng nhất SB3 <-> Numpy (gồm ca 1 nhánh chạm trần) trước khi train
     numpy_policy.load_from_sb3(model, odd_symmetric=use_odd_sym)
     if use_odd_sym:
         zero_obs = np.zeros(obs_dim, dtype=np.float32)
@@ -179,16 +161,46 @@ def train():
         assert abs(sb3_zero) < 1e-6, f"Odd-symmetry check failed at 0: {sb3_zero}"
         assert abs(sb3_pos + sb3_neg) < 1e-6, f"Odd-symmetry check failed: {sb3_pos} vs {sb3_neg}"
         assert abs(sb3_pos - np_pos) < 1e-5, f"SB3 vs Numpy parity failed: {sb3_pos} vs {np_pos}"
-        print(f"[Symmetry Verified] SB3 f(0)={sb3_zero:+.2e}, f(x)+f(-x)={sb3_pos+sb3_neg:+.2e}, |SB3-Numpy|={abs(sb3_pos-np_pos):.2e}")
+
+        # Kiểm thử bắt buộc trường hợp 1 nhánh chạm trần [-1, 1] trên bản sao policy của SB3
+        probe_sb3_pol = copy.deepcopy(model.policy)
+        with torch.no_grad():
+            probe_sb3_pol.action_net.weight.mul_(200.0)
+            probe_sb3_pol.action_net.bias.fill_(0.45)
+        probe_np_pol = NumpyMLPPolicy(input_dim=obs_dim, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1, odd_symmetric=True)
+        probe_np_pol.w1 = probe_sb3_pol.mlp_extractor.policy_net[0].weight.detach().cpu().numpy().copy()
+        probe_np_pol.b1 = probe_sb3_pol.mlp_extractor.policy_net[0].bias.detach().cpu().numpy().copy()
+        probe_np_pol.w2 = probe_sb3_pol.mlp_extractor.policy_net[2].weight.detach().cpu().numpy().copy()
+        probe_np_pol.b2 = probe_sb3_pol.mlp_extractor.policy_net[2].bias.detach().cpu().numpy().copy()
+        probe_np_pol.w3 = probe_sb3_pol.action_net.weight.detach().cpu().numpy().copy()
+        probe_np_pol.b3 = probe_sb3_pol.action_net.bias.detach().cpu().numpy().copy()
+        sat_probes = find_one_branch_saturation_vectors(probe_np_pol, max_trials=2000, seed=99)
+        assert sat_probes, "Không tìm thấy mẫu 1 nhánh chạm trần trên probe_sb3_pol!"
+        svec, rp, rn, bc, nc = sat_probes[0]
+        sb3_sat = float(np.asarray(probe_sb3_pol.predict(svec, deterministic=True)[0]).item())
+        np_sat = probe_np_pol.forward(svec)
+        c_sat, _ = simulate_c_inference(probe_np_pol, *svec.tolist())
+        assert abs(sb3_sat - np_sat) <= 1e-5 and abs(np_sat - c_sat) <= 1e-5, (
+            f"1-branch saturation mismatch: SB3={sb3_sat}, Numpy={np_sat}, C={c_sat}"
+        )
+        print(
+            f"[Symmetry Verified] SB3 f(0)={sb3_zero:+.2e}, f(x)+f(-x)={sb3_pos+sb3_neg:+.2e} | "
+            f"1-Branch Sat (raw={rp:+.2f},{rn:+.2f}): SB3={sb3_sat:+.5f}, Numpy={np_sat:+.5f}, C={c_sat:+.5f} "
+            f"(naive_diff_clip={nc:+.5f})"
+        )
 
     ckpt_dir = config['export']['checkpoint_dir']
     os.makedirs(ckpt_dir, exist_ok=True)
+    hdr_dir = config['export']['header_output_dir']
+    base_hdr = config['export'].get('header_filename', 'rl_sb3_stm32.h')
+    stem, ext = os.path.splitext(base_hdr)
     run_label = args.tag if args.tag else "candidate"
     run_suffix = f"_{run_label}"
     best_npz_path = os.path.join(ckpt_dir, f"best_policy{run_suffix}.npz" if args.tag else "candidate_best_policy.npz")
     runner_up_npz_path = os.path.join(ckpt_dir, f"runner_up_policy{run_suffix}.npz" if args.tag else "candidate_runner_up_policy.npz")
     final_npz_path = os.path.join(ckpt_dir, f"final_policy{run_suffix}.npz" if args.tag else "candidate_final_policy.npz")
     final_sb3_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_final_model{run_suffix}.zip")
+    final_hdr_path = os.path.join(hdr_dir, f"{stem}_{run_label}_final{ext}")
     cand_glob = os.path.join(ckpt_dir, f"cand{run_suffix}_step*.npz")
 
     # Xóa checkpoint và file ứng viên cũ của cùng nhãn chạy để tránh lẫn với đợt train trước
@@ -257,12 +269,14 @@ def train():
     print(f"[Training] Bắt đầu quá trình huấn luyện {total_timesteps} timesteps (w_pos={config['reward_weights']['w_pos']}, top_k={args.top_k})...")
     model.learn(total_timesteps=total_timesteps, callback=eval_callback)
 
-    # Lưu checkpoint cuối đợt train vào final_policy
+    # Lưu checkpoint cuối đợt train vào final_policy & đối chiếu SB3 <-> NumPy <-> C Header (gồm ca 1 nhánh chạm trần)
     final_step = int(model.num_timesteps)
     model.save(final_sb3_path)
     numpy_policy.load_from_sb3(model, odd_symmetric=use_odd_sym)
     numpy_policy.save_weights(final_npz_path)
-    print(f"\n[Checkpoint] Đã lưu model cuối đợt train (step {final_step}) sang: {final_npz_path}")
+    export_sb3_c_header(numpy_policy, final_hdr_path)
+    print(f"\n[Checkpoint] Đã lưu model cuối đợt train (step {final_step}) sang: {final_npz_path} & {final_hdr_path}")
+    verify_policy_parity(numpy_policy, f"trained_final_{run_label}", sb3_model=model, header_path=final_hdr_path)
 
     final_quick = evaluator.evaluate(numpy_policy, quick_eval=True)
     print(_fmt_eval_line(f"Eval @ Final ({final_step})", final_quick))
@@ -318,10 +332,6 @@ def train():
     numpy_policy = winner_rec['policy']
     numpy_policy.save_weights(best_npz_path)
     print(f"[Final Selection] #1 theo 98 ca: {winner_rec['label']} -> {best_npz_path}")
-
-    hdr_dir = config['export']['header_output_dir']
-    base_hdr = config['export'].get('header_filename', 'rl_sb3_stm32.h')
-    stem, ext = os.path.splitext(base_hdr)
 
     if len(full_records) >= 2:
         runner_up_rec = full_records[1]
