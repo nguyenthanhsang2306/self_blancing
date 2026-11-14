@@ -108,7 +108,7 @@ class SelfBalancingGymEnv(gym.Env):
         self.w_action_diff = rw.get('w_action_diff', 1.50)
         self.fall_penalty = rw.get('fall_penalty', 100.0)
         # Phạt thêm vận tốc liên tục khi gần thẳng & gần gốc (giảm dao động, không cản phản xạ lúc vừa bị đẩy)
-        self.near_origin_vel_max = float(rw.get('near_origin_vel_max', 0.02))
+        self.near_origin_vel_max = float(rw.get('near_origin_vel_max', 0.0))
         self.near_origin_pos_m = float(rw.get('near_origin_pos_m', 0.05))
         self.near_origin_theta_rad = math.radians(float(rw.get('near_origin_theta_deg', 2.0)))
         self.near_origin_vel_mps = float(rw.get('near_origin_vel_mps', 0.03))
