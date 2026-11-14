@@ -21,10 +21,157 @@ def make_env_fn(config, env_rank, base_seed):
         return SelfBalancingGymEnv(config, env_rank=env_rank, seed=base_seed + env_rank * 1009)
     return _init
 
+def resolve_training_hparams(config, timesteps=None, learning_rate=None, eval_freq=None):
+    rl_cfg = config.get('rl_training', {})
+    resolved_timesteps = int(timesteps) if timesteps is not None else int(rl_cfg.get('total_timesteps', 400000))
+    resolved_lr = float(learning_rate) if learning_rate is not None else float(rl_cfg.get('learning_rate', 0.0003))
+    resolved_eval_freq = int(eval_freq) if eval_freq is not None else int(rl_cfg.get('eval_freq', 20000))
+    if resolved_timesteps < 1:
+        raise ValueError(f"total_timesteps phải >= 1, nhận {resolved_timesteps}")
+    if resolved_lr <= 0.0:
+        raise ValueError(f"learning_rate phải > 0, nhận {resolved_lr}")
+    if resolved_eval_freq < 1:
+        raise ValueError(f"eval_freq phải >= 1, nhận {resolved_eval_freq}")
+    return resolved_timesteps, resolved_lr, resolved_eval_freq
+
+def load_init_actor_policy(weights_path, expected_input_dim, expected_hidden_dims=(64, 64)):
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Không tìm thấy checkpoint khởi tạo actor: {weights_path}")
+    pol = NumpyMLPPolicy(
+        input_dim=expected_input_dim,
+        hidden_dims=expected_hidden_dims,
+        output_dim=1,
+    )
+    pol.load_weights(weights_path)
+    h1, h2 = int(expected_hidden_dims[0]), int(expected_hidden_dims[1])
+    expected_shapes = {
+        'w1': (h1, expected_input_dim),
+        'b1': (h1,),
+        'w2': (h2, h1),
+        'b2': (h2,),
+        'w3': (1, h2),
+        'b3': (1,),
+    }
+    for name, exp_shape in expected_shapes.items():
+        arr = getattr(pol, name)
+        if arr.shape != exp_shape:
+            raise ValueError(f"Kích thước {name} trong {weights_path} là {arr.shape}, kỳ vọng {exp_shape}")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"Trọng số {name} trong {weights_path} chứa NaN/Inf")
+    return pol
+
+def init_sb3_actor_from_numpy(sb3_model, numpy_policy, torch_module):
+    policy_net = sb3_model.policy.mlp_extractor.policy_net
+    action_net = sb3_model.policy.action_net
+    pairs = [
+        (policy_net[0].weight, numpy_policy.w1),
+        (policy_net[0].bias, numpy_policy.b1),
+        (policy_net[2].weight, numpy_policy.w2),
+        (policy_net[2].bias, numpy_policy.b2),
+        (action_net.weight, numpy_policy.w3),
+        (action_net.bias, numpy_policy.b3),
+    ]
+    with torch_module.no_grad():
+        for dst, src in pairs:
+            src_arr = np.asarray(src, dtype=np.float32)
+            if tuple(dst.shape) != tuple(src_arr.shape):
+                raise ValueError(f"Shape actor không khớp khi nạp vào SB3: dst={tuple(dst.shape)} vs src={tuple(src_arr.shape)}")
+            dst.copy_(torch_module.as_tensor(src_arr, device=dst.device, dtype=dst.dtype))
+
+def select_finetune_winner(full_records, step0_full=None):
+    """
+    Áp dụng quy tắc chọn checkpoint khi tinh chỉnh:
+    Chỉ chọn checkpoint mới thay cho step 0 nếu giữ vị trí TỐT HƠN (hold_count > step0_hold)
+    MÀ số ca bị dừng KHÔNG TĂNG (fall_count <= step0_fall).
+    """
+    if not full_records:
+        raise ValueError("Danh sách full_records rỗng, không thể chọn checkpoint thắng.")
+
+    step0_rec = next((r for r in full_records if r.get('step') == 0), None)
+    if step0_full is None and step0_rec is not None:
+        step0_full = step0_rec['full_summary']
+
+    sorted_all = sorted(full_records, key=lambda r: r['full_summary']['ranking_key'], reverse=True)
+    if step0_full is None:
+        winner = sorted_all[0]
+        runner_up = sorted_all[1] if len(sorted_all) >= 2 else None
+        return winner, runner_up, False, "Không dùng init-weights; chọn theo ranking_key chuẩn."
+
+    step0_hold = int(step0_full['hold_count'])
+    step0_fall = int(step0_full['fall_count'])
+
+    qualifying = [
+        r for r in sorted_all
+        if r.get('step', -1) != 0
+        and int(r['full_summary']['hold_count']) > step0_hold
+        and int(r['full_summary']['fall_count']) <= step0_fall
+    ]
+    if qualifying:
+        winner = qualifying[0]
+        others = [r for r in sorted_all if r is not winner]
+        runner_up = others[0] if others else None
+        ws = winner['full_summary']
+        msg = (
+            f"[Guard Passed] Bản mới `{winner['label']}` vượt mốc step 0: "
+            f"Giữ VT {ws['hold_count']}/{ws['total_runs']} (> {step0_hold}), "
+            f"Ngã {ws['fall_count']}/{ws['total_runs']} (<= {step0_fall})."
+        )
+        return winner, runner_up, False, msg
+
+    non_zero = [r for r in sorted_all if r.get('step', -1) != 0]
+    runner_up = non_zero[0] if non_zero else None
+    winner = step0_rec
+    msg = (
+        f"[Guard Active] Không có checkpoint mới nào vượt mốc step 0 "
+        f"(cần Giữ VT > {step0_hold} và Ngã <= {step0_fall}). Giữ nguyên checkpoint step 0."
+    )
+    return winner, runner_up, True, msg
+
+def format_real_robot_gate_gaps(summary, header_title="Chi tiết 24 ca cổng STM32 (`real_robot`)"):
+    results = summary.get('detailed_results', [])
+    no_kick_10s = [r for r in results if (not r.get('is_long')) and abs(r['kick']) < 1e-6]
+    long_no_kick = [r for r in results if r.get('is_long') and abs(r['kick']) < 1e-6]
+    zero_kick = [
+        r for r in results
+        if (not r.get('is_long')) and abs(r['init_theta']) < 1e-6 and abs(abs(r['kick']) - 1.5) < 1e-6
+    ]
+
+    subsets = [
+        ("Không nhiễu 10s", no_kick_10s),
+        ("Chạy dài không nhiễu (25–30s)", long_no_kick),
+        ("Cú đẩy 0° (±1.5 N)", zero_kick),
+    ]
+    total_gate = sum(len(items) for _, items in subsets)
+    passed_gate = sum(
+        1 for _, items in subsets for r in items if (not r['fallen']) and r['position_held']
+    )
+
+    lines = [f"### {header_title}: {passed_gate}/{total_gate} ca đạt"]
+    failing_lines = []
+    for sub_name, items in subsets:
+        for r in items:
+            if r['fallen'] or not r['position_held']:
+                status_txt = f"NGÃ @ {r['survive_time']:.2f}s" if r['fallen'] else "CHƯA GIỮ VT"
+                failing_lines.append(
+                    f"- [{sub_name}] {r['vbat']:.1f}V, {r['init_theta']:+.1f}°, "
+                    f"kick {r['kick']:+.1f} N, {r['duration']:.0f}s: **{status_txt}** "
+                    f"(final|x|={r['final_x']*100:.2f} cm, max|x|={r['max_x']*100:.2f} cm, "
+                    f"max|θ|={r['max_deg']:.2f}°)"
+                )
+    if failing_lines:
+        lines.append(f"Còn thiếu {len(failing_lines)}/{total_gate} ca:")
+        lines.extend(failing_lines)
+    else:
+        lines.append("Đã đạt đủ 24/24 ca cổng STM32 `real_robot`!")
+    return "\n".join(lines)
+
 def train():
     parser = argparse.ArgumentParser(description="Train RL Self-Balancing Robot via Stable-Baselines3 (PPO)")
     parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to default.yaml")
     parser.add_argument("--timesteps", type=int, default=None, help="Override training timesteps")
+    parser.add_argument("--learning-rate", type=float, default=None, help="Override rl_training.learning_rate (e.g. 3e-5)")
+    parser.add_argument("--eval-freq", type=int, default=None, help="Override rl_training.eval_freq in timesteps (e.g. 10000)")
+    parser.add_argument("--init-weights", type=str, default=None, help="Path to .npz policy checkpoint to warm-start SB3 actor weights/biases")
     parser.add_argument("--w-pos", type=float, default=None, help="Override reward_weights.w_pos")
     parser.add_argument("--recenter-prob", type=float, default=None, help="Override gym_env.recenter_init_prob (e.g. 0.0 to disable, 0.30 for 30%%)")
     parser.add_argument("--tag", type=str, default=None, help="Optional suffix tag for checkpoint and header outputs")
@@ -70,7 +217,23 @@ def train():
     print(f"[Env] Action space:                {env.action_space}")
 
     rl_cfg = config['rl_training']
-    total_timesteps = args.timesteps if args.timesteps is not None else rl_cfg['total_timesteps']
+    try:
+        total_timesteps, learning_rate, eval_freq = resolve_training_hparams(
+            config,
+            timesteps=args.timesteps,
+            learning_rate=args.learning_rate,
+            eval_freq=args.eval_freq,
+        )
+    except ValueError as err:
+        parser.error(str(err))
+
+    if args.timesteps is not None:
+        print(f"[Config Override] rl_training.total_timesteps = {total_timesteps}")
+    if args.learning_rate is not None:
+        print(f"[Config Override] rl_training.learning_rate = {learning_rate:.2e}")
+    if args.eval_freq is not None:
+        print(f"[Config Override] rl_training.eval_freq = {eval_freq}")
+
     algo_name = rl_cfg.get('algorithm', 'PPO').upper()
     net_arch = rl_cfg.get('net_arch', [64, 64])
     use_odd_sym = bool(rl_cfg.get('odd_symmetric', False)) if args.odd_symmetric is None else bool(args.odd_symmetric)
@@ -83,6 +246,23 @@ def train():
         odd_symmetric=use_odd_sym,
     )
     evaluator = PolicyEvaluator(config)
+
+    init_np_policy = None
+    if args.init_weights is not None:
+        try:
+            init_np_policy = load_init_actor_policy(
+                args.init_weights,
+                expected_input_dim=obs_dim,
+                expected_hidden_dims=(net_arch[0], net_arch[1]),
+            )
+        except (FileNotFoundError, ValueError) as err:
+            sys.exit(f"[Error] {err}")
+        if bool(init_np_policy.odd_symmetric) != bool(use_odd_sym):
+            print(
+                f"[Warning] Checkpoint khởi tạo có odd_symmetric={init_np_policy.odd_symmetric}, "
+                f"nhưng cấu hình train đang dùng odd_symmetric={use_odd_sym}."
+            )
+        print(f"[Init] Đã đọc sẵn actor 3 tầng từ: {args.init_weights} (odd_symmetric={init_np_policy.odd_symmetric})")
 
     if args.demo_sample:
         print("[Notice] Chế độ --demo-sample: Tạo trọng số mẫu để kiểm tra pipeline xuất C.")
@@ -136,10 +316,13 @@ def train():
 
     n_steps_per_env = max(256, int(2048 / n_envs)) if n_envs > 1 else 2048
 
+    run_label = args.tag if args.tag else "candidate"
+    run_suffix = f"_{run_label}"
+
     model = PPO(
         policy_cls,
         train_env,
-        learning_rate=rl_cfg.get('learning_rate', 0.0003),
+        learning_rate=learning_rate,
         gamma=rl_cfg.get('gamma', 0.99),
         n_steps=n_steps_per_env,
         batch_size=rl_cfg.get('batch_size', 64),
@@ -149,8 +332,25 @@ def train():
         verbose=1
     )
 
+    if init_np_policy is not None:
+        init_sb3_actor_from_numpy(model, init_np_policy, torch)
+        print(f"[Init] Đã nạp đủ trọng số và bias 3 tầng actor (w1, b1, w2, b2, w3, b3) vào SB3 PPO.")
+
     # Kiểm tra nhanh tính đối xứng lẻ & đồng nhất SB3 <-> Numpy (gồm ca 1 nhánh chạm trần) trước khi train
     numpy_policy.load_from_sb3(model, odd_symmetric=use_odd_sym)
+    if init_np_policy is not None:
+        max_init_w_diff = max(
+            float(np.max(np.abs(numpy_policy.w1 - init_np_policy.w1))),
+            float(np.max(np.abs(numpy_policy.b1 - init_np_policy.b1))),
+            float(np.max(np.abs(numpy_policy.w2 - init_np_policy.w2))),
+            float(np.max(np.abs(numpy_policy.b2 - init_np_policy.b2))),
+            float(np.max(np.abs(numpy_policy.w3 - init_np_policy.w3))),
+            float(np.max(np.abs(numpy_policy.b3 - init_np_policy.b3))),
+        )
+        assert max_init_w_diff <= 1e-6, f"Nạp trọng số vào SB3 bị lệch: {max_init_w_diff}"
+        verify_policy_parity(numpy_policy, f"init_{run_label}_step0", sb3_model=model)
+        print(f"[Init Parity] Trọng số SB3 <-> checkpoint gốc lệch tối đa {max_init_w_diff:.2e}; đầu ra SB3 khớp NumPy & C.")
+
     if use_odd_sym:
         zero_obs = np.zeros(obs_dim, dtype=np.float32)
         probe_obs = np.linspace(-0.08, 0.08, obs_dim, dtype=np.float32)
@@ -194,8 +394,6 @@ def train():
     hdr_dir = config['export']['header_output_dir']
     base_hdr = config['export'].get('header_filename', 'rl_sb3_stm32.h')
     stem, ext = os.path.splitext(base_hdr)
-    run_label = args.tag if args.tag else "candidate"
-    run_suffix = f"_{run_label}"
     best_npz_path = os.path.join(ckpt_dir, f"best_policy{run_suffix}.npz" if args.tag else "candidate_best_policy.npz")
     runner_up_npz_path = os.path.join(ckpt_dir, f"runner_up_policy{run_suffix}.npz" if args.tag else "candidate_runner_up_policy.npz")
     final_npz_path = os.path.join(ckpt_dir, f"final_policy{run_suffix}.npz" if args.tag else "candidate_final_policy.npz")
@@ -216,6 +414,29 @@ def train():
             f"Giữ VT: {summary['hold_count']}/{summary['total_runs']} | "
             f"Final X: {summary['mean_final_x_m']*100:.2f}cm | Settle: {settle_str}"
         )
+
+    step0_cand_path = None
+    step0_quick = None
+    step0_full = None
+    step0_gate_gaps_md = ""
+    if init_np_policy is not None:
+        step0_cand_path = os.path.join(ckpt_dir, f"cand{run_suffix}_step0.npz")
+        numpy_policy.save_weights(step0_cand_path)
+        step0_quick = evaluator.evaluate(numpy_policy, quick_eval=True)
+        print(_fmt_eval_line("Init Quick Step 0", step0_quick))
+        step0_full = evaluator.evaluate(numpy_policy, quick_eval=False)
+        print(_fmt_eval_line("Init Full Step 0 (98 ca)", step0_full))
+        step0_gate_gaps_md = format_real_robot_gate_gaps(
+            step0_full,
+            header_title="Mốc Step 0 — Chi tiết 24 ca cổng STM32 (`real_robot`)",
+        )
+        print(step0_gate_gaps_md)
+        if os.path.basename(args.init_weights) == "best_policy_wpos_030_sym.npz":
+            assert step0_full['hold_count'] == 57 and step0_full['fall_count'] == 24, (
+                f"Mốc step 0 từ best_policy_wpos_030_sym.npz không khớp 57/98 giữ VT, 24/98 ngã: "
+                f"thực tế {step0_full['hold_count']}/98 giữ VT, {step0_full['fall_count']}/98 ngã"
+            )
+            print("[Baseline Confirmed] Đã xác nhận mốc step 0 đạt đúng 57/98 giữ vị trí, 24/98 bị dừng.")
 
     # Callback giữ lại Top-K checkpoint đứng đầu theo bài test nhanh 6s (mặc định K=3)
     class TopKQuickCheckpointCallback(BaseCallback):
@@ -261,12 +482,15 @@ def train():
             return True
 
     eval_callback = TopKQuickCheckpointCallback(
-        eval_freq=rl_cfg.get('eval_freq', 20000),
+        eval_freq=eval_freq,
         top_k=args.top_k,
         verbose=1,
     )
 
-    print(f"[Training] Bắt đầu quá trình huấn luyện {total_timesteps} timesteps (w_pos={config['reward_weights']['w_pos']}, top_k={args.top_k})...")
+    print(
+        f"[Training] Bắt đầu quá trình huấn luyện {total_timesteps} timesteps "
+        f"(lr={learning_rate:.2e}, eval_freq={eval_freq}, w_pos={config['reward_weights']['w_pos']}, top_k={args.top_k})..."
+    )
     model.learn(total_timesteps=total_timesteps, callback=eval_callback)
 
     # Lưu checkpoint cuối đợt train vào final_policy & đối chiếu SB3 <-> NumPy <-> C Header (gồm ca 1 nhánh chạm trần)
@@ -281,13 +505,22 @@ def train():
     final_quick = evaluator.evaluate(numpy_policy, quick_eval=True)
     print(_fmt_eval_line(f"Eval @ Final ({final_step})", final_quick))
 
-    # Gom ứng viên (Top-K quick + checkpoint cuối) để đưa vào sàng lọc 2 bước
+    # Gom ứng viên (Step 0 nếu warm-start + Top-K quick + checkpoint cuối) để đưa vào sàng lọc 2 bước
     def _load_policy(weights_path):
         pol = NumpyMLPPolicy(input_dim=obs_dim, hidden_dims=(net_arch[0], net_arch[1]), output_dim=1)
         pol.load_weights(weights_path)
         return pol
 
     candidates = []
+    if step0_cand_path is not None and os.path.exists(step0_cand_path):
+        candidates.append({
+            'label': f"step_0 (init:{os.path.basename(args.init_weights)})",
+            'step': 0,
+            'path': step0_cand_path,
+            'policy': _load_policy(step0_cand_path),
+            'quick_summary': step0_quick,
+        })
+
     merged_final = False
     for entry in eval_callback.top_entries:
         if entry['step'] == final_step:
@@ -317,45 +550,67 @@ def train():
             'quick_summary': final_quick,
         })
 
-    # GIAI ĐOẠN 2 (22 ca không nhiễu) -> GIAI ĐOẠN 3 (Top 2 trên đủ 98 ca)
+    # GIAI ĐOẠN 2 (22 ca không nhiễu) -> GIAI ĐOẠN 3 (Top K trên đủ 98 ca)
+    top_full_n = min(len(candidates), 3 if step0_full is not None else 2)
     print("\n" + "=" * 78)
-    print(f"   CHỌN CHECKPOINT 2 BƯỚC ({len(candidates)} ỨNG VIÊN -> 22 CA KHÔNG NHIỄU -> TOP 2 / 98 CA)")
+    print(f"   CHỌN CHECKPOINT 2 BƯỚC ({len(candidates)} ỨNG VIÊN -> 22 CA KHÔNG NHIỄU -> TOP {top_full_n} / 98 CA)")
     print("=" * 78)
-    screened_records, full_records = evaluator.select_top_candidates(candidates, top_full=2)
+    screened_records, full_records = evaluator.select_top_candidates(candidates, top_full=top_full_n)
+
+    # Đảm bảo step 0 luôn có mặt trong danh sách 98 ca để tham gia xếp hạng và đối chiếu guard
+    if step0_full is not None and not any(r.get('step') == 0 for r in full_records):
+        step0_screen = next((r for r in screened_records if r.get('step') == 0), None)
+        if step0_screen is not None:
+            full_records.append({**step0_screen, 'full_summary': step0_full})
+            full_records.sort(key=lambda r: r['full_summary']['ranking_key'], reverse=True)
+
     two_stage_report = evaluator.format_two_stage_report(
         screened_records, full_records, deploy_gate_mode=args.deploy_gate
     )
     print("\n" + two_stage_report + "\n")
 
-    winner_rec = full_records[0]
+    winner_rec, runner_up_rec, guard_active, guard_msg = select_finetune_winner(
+        full_records, step0_full=step0_full
+    )
+    print(guard_msg)
     summary = winner_rec['full_summary']
     numpy_policy = winner_rec['policy']
     numpy_policy.save_weights(best_npz_path)
-    print(f"[Final Selection] #1 theo 98 ca: {winner_rec['label']} -> {best_npz_path}")
+    print(f"[Final Selection] #1 đã chọn ({winner_rec['label']}): -> {best_npz_path}")
 
-    if len(full_records) >= 2:
-        runner_up_rec = full_records[1]
+    if runner_up_rec is not None:
         runner_up_rec['policy'].save_weights(runner_up_npz_path)
         runner_up_hdr_path = os.path.join(hdr_dir, f"{stem}_{run_label}_runner_up{ext}")
         export_sb3_c_header(runner_up_rec['policy'], runner_up_hdr_path)
-        print(f"[Runner-Up] #2 theo 98 ca: {runner_up_rec['label']} -> {runner_up_npz_path} & {runner_up_hdr_path}")
+        print(f"[Runner-Up] #2: {runner_up_rec['label']} -> {runner_up_npz_path} & {runner_up_hdr_path}")
 
     # Dọn file ứng viên tạm (chỉ giữ lại best, runner_up và final)
     for cand_tmp in glob.glob(cand_glob):
         if os.path.exists(cand_tmp):
             os.remove(cand_tmp)
 
-    # Báo cáo chi tiết của bản #1
+    # Báo cáo chi tiết của bản #1 và các ca còn thiếu của cổng STM32 (real_robot)
     print("\n" + "=" * 78)
     print(f"      BÁO CÁO CHI TIẾT CHECKPOINT #1: {winner_rec['label']} (98 KỊCH BẢN) ")
     print("=" * 78)
     winner_report = evaluator.format_report(summary, deploy_gate_mode=args.deploy_gate)
+    winner_gate_gaps_md = format_real_robot_gate_gaps(
+        summary,
+        header_title=f"Checkpoint #1 (`{winner_rec['label']}`) — Chi tiết 24 ca cổng STM32 (`real_robot`)",
+    )
     print("\n" + winner_report + "\n")
+    print(winner_gate_gaps_md + "\n")
+
+    report_sections = [two_stage_report, f"**Quyết định chọn checkpoint:** {guard_msg}"]
+    if step0_gate_gaps_md:
+        report_sections.append(step0_gate_gaps_md)
+    report_sections.append(winner_gate_gaps_md)
+    report_sections.append(winner_report)
 
     report_path = os.path.join("outputs", "reports", f"eval_report_{run_label}.md")
     os.makedirs(os.path.dirname(report_path), exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as rf:
-        rf.write(two_stage_report + "\n\n---\n\n" + winner_report + "\n")
+        rf.write("\n\n---\n\n".join(report_sections) + "\n")
     print(f"[Report] Đã lưu báo cáo chọn lọc 2 bước & đánh giá 98 ca sang: {report_path}")
 
     # XUẤT C HEADER SAU KHI ĐÃ ĐÁNH GIÁ VÀ KIỂM TRA CỔNG AN TOÀN STM32
