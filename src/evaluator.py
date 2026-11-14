@@ -6,6 +6,7 @@ class PolicyEvaluator:
     """
     Bộ đánh giá độc lập toàn diện cho Controller (9D PPO RL):
       - Ma trận chuẩn 10s (90 ca): Góc [-5°, -3°, -1°, +1°, +3°, +5°] x Xung [0, ±1, ±2 N] x Pin [7.2, 7.4, 8.4 V]
+      - 2 ca nhiễu từ góc 0° (10s @ 7.4V): Góc 0.0° x Xung [+1.5, -1.5 N]
       - Các ca dài 20–30s (6 ca): Bắt lỗi trôi vị trí chậm sau khi góc đã cân bằng.
       - Tiêu chí giữ vị trí ĐẠT: Không ngã và giữ |theta| <= 0.5° và |x| <= 2.0 cm trong 2.0 giây cuối.
       - Xếp hạng checkpoint: Ít ngã nhất -> Nhiều ca giữ vị trí đạt nhất -> Sai số vị trí cuối thấp nhất.
@@ -22,6 +23,11 @@ class PolicyEvaluator:
         self.hold_window_s = 2.0
         self.hold_angle_deg = 0.50
         self.hold_pos_m = 0.020
+        # 2 ca bắt đầu từ 0° với xung ±1.5 N để đối chiếu trực tiếp với đồ thị thực nghiệm
+        self.zero_deg_kick_scenarios = [
+            (0.0, +1.5, 7.4, 10.0),
+            (0.0, -1.5, 7.4, 10.0),
+        ]
         # Các ca kiểm tra dài 20-30s để phát hiện trôi vị trí chậm
         self.long_scenarios = [
             (-5.0, 0.0, 7.4, 25.0),
@@ -31,6 +37,30 @@ class PolicyEvaluator:
             (-1.0, 0.0, 7.2, 30.0),
             (+1.0, 0.0, 8.4, 30.0),
         ]
+
+    def compute_hold_metrics(self, t_hist, theta_hist, x_hist, fallen, duration):
+        """
+        Chỉ tính là giữ vị trí ĐẠT khi xe không ngã và duy trì đồng thời
+        |theta| <= 0.5° và |x| <= 2.0 cm trong trọn vẹn 2.0 giây cuối.
+        """
+        ts = float(self.config.get('system', {}).get('Ts', 0.005))
+        hold_steps = max(1, int(round(min(self.hold_window_s, duration) / ts)))
+        position_held = False
+        settling_time = None
+        if not fallen and len(t_hist) >= hold_steps:
+            in_bounds = [
+                (abs(th) <= self.hold_angle_deg and abs(pos) <= self.hold_pos_m)
+                for th, pos in zip(theta_hist, x_hist)
+            ]
+            if all(in_bounds[-hold_steps:]):
+                position_held = True
+                last_violation_idx = -1
+                for i in range(len(in_bounds) - 1, -1, -1):
+                    if not in_bounds[i]:
+                        last_violation_idx = i
+                        break
+                settling_time = 0.0 if last_violation_idx == -1 else float(t_hist[last_violation_idx + 1])
+        return position_held, settling_time
 
     def evaluate_single_run(self, policy, init_theta_deg, kick_n, vbat_v, duration=10.0, eval_seed=1001):
         env = SelfBalancingGymEnv(self.config, seed=eval_seed)
@@ -80,24 +110,7 @@ class PolicyEvaluator:
         final_x = float(abs(x_hist[-1]))
         rms_pwm = float(np.sqrt(np.mean(np.square(pwm_hist))))
 
-        # Chỉ tính là giữ vị trí ĐẠT khi xe không ngã và duy trì đồng thời
-        # |theta| <= 0.5° và |x| <= 2.0 cm trong trọn vẹn 2.0 giây cuối.
-        hold_steps = max(1, int(round(min(self.hold_window_s, duration) / env.Ts)))
-        position_held = False
-        settling_time = None
-        if not fallen and len(t_hist) >= hold_steps:
-            in_bounds = [
-                (abs(th) <= self.hold_angle_deg and abs(pos) <= self.hold_pos_m)
-                for th, pos in zip(theta_hist, x_hist)
-            ]
-            if all(in_bounds[-hold_steps:]):
-                position_held = True
-                last_violation_idx = -1
-                for i in range(len(in_bounds) - 1, -1, -1):
-                    if not in_bounds[i]:
-                        last_violation_idx = i
-                        break
-                settling_time = 0.0 if last_violation_idx == -1 else float(t_hist[last_violation_idx + 1])
+        position_held, settling_time = self.compute_hold_metrics(t_hist, theta_hist, x_hist, fallen, duration)
 
         return {
             'init_theta': init_theta_deg,
@@ -116,11 +129,54 @@ class PolicyEvaluator:
             'rms_pwm': rms_pwm
         }
 
+    def _summarize_subset(self, runs):
+        total_runs = len(runs)
+        fall_count = sum(1 for r in runs if r['fallen'])
+        fall_rate = (fall_count / total_runs) * 100.0 if total_runs else 0.0
+        hold_count = sum(1 for r in runs if r['position_held'])
+        hold_rate = (hold_count / total_runs) * 100.0 if total_runs else 0.0
+
+        survived_runs = [r for r in runs if not r['fallen']]
+        held_runs = [r for r in runs if r['position_held']]
+        mean_survive_s = float(np.mean([r['survive_time'] for r in runs])) if runs else 0.0
+
+        if survived_runs:
+            mean_max_x = float(np.mean([r['max_x'] for r in survived_runs]))
+            max_x_worst = float(np.max([r['max_x'] for r in survived_runs]))
+            mean_final_x = float(np.mean([r['final_x'] for r in survived_runs]))
+            max_final_x = float(np.max([r['final_x'] for r in survived_runs]))
+            mean_rms_pwm = float(np.mean([r['rms_pwm'] for r in survived_runs]))
+        else:
+            mean_max_x = 1.0
+            max_x_worst = 1.0
+            mean_final_x = 1.0
+            max_final_x = 1.0
+            mean_rms_pwm = 999.0
+
+        mean_settle = float(np.mean([r['settling_time'] for r in held_runs])) if held_runs else None
+
+        return {
+            'total_runs': total_runs,
+            'survived_count': len(survived_runs),
+            'has_survivors': bool(survived_runs),
+            'fall_count': fall_count,
+            'fall_rate_pct': fall_rate,
+            'hold_count': hold_count,
+            'hold_rate_pct': hold_rate,
+            'mean_max_x_m': mean_max_x,
+            'max_x_worst_m': max_x_worst,
+            'mean_final_x_m': mean_final_x,
+            'max_final_x_m': max_final_x,
+            'mean_settle_s': mean_settle,
+            'mean_survive_s': mean_survive_s,
+            'mean_rms_pwm': mean_rms_pwm,
+        }
+
     def evaluate(self, policy, quick_eval=False, include_long=True):
         """
         Đánh giá độc lập với bộ Seed cố định (Independent Evaluation Suite):
           - quick_eval=True: Bộ test nhanh trong khi huấn luyện (18 ca 6s)
-          - quick_eval=False: Bộ test đầy đủ (90 ca 10s + 6 ca dài 20–30s để bắt lỗi trôi chậm)
+          - quick_eval=False: Bộ test đầy đủ 98 ca (90 ca chuẩn 10s + 2 ca 0° ±1.5N + 6 ca dài 20–30s)
         """
         if quick_eval:
             angles = [-5.0, -3.0, -1.0, 1.0, 3.0, 5.0]
@@ -143,78 +199,136 @@ class PolicyEvaluator:
                     res = self.evaluate_single_run(policy, th, k, v, duration=duration, eval_seed=case_seed)
                     results.append(res)
 
+        if not quick_eval:
+            for idx, (th, k, v, dur) in enumerate(self.zero_deg_kick_scenarios, start=1):
+                case_seed = 5500 + idx
+                res = self.evaluate_single_run(policy, th, k, v, duration=dur, eval_seed=case_seed)
+                results.append(res)
+
         if not quick_eval and include_long:
             for idx, (th, k, v, long_dur) in enumerate(self.long_scenarios, start=1):
                 case_seed = 6000 + idx
                 res = self.evaluate_single_run(policy, th, k, v, duration=long_dur, eval_seed=case_seed)
                 results.append(res)
 
-        total_runs = len(results)
-        fall_count = sum(1 for r in results if r['fallen'])
-        fall_rate = (fall_count / total_runs) * 100.0
-        hold_count = sum(1 for r in results if r['position_held'])
-        hold_rate = (hold_count / total_runs) * 100.0
+        overall = self._summarize_subset(results)
 
-        survived_runs = [r for r in results if not r['fallen']]
-        held_runs = [r for r in results if r['position_held']]
-        mean_survive_s = float(np.mean([r['survive_time'] for r in results])) if results else 0.0
+        no_kick_runs = [r for r in results if (not r['is_long']) and abs(r['kick']) < 1e-6]
+        with_kick_runs = [r for r in results if (not r['is_long']) and abs(r['kick']) >= 1e-6]
+        long_drift_runs = [r for r in results if r['is_long']]
 
-        if survived_runs:
-            mean_max_x = float(np.mean([r['max_x'] for r in survived_runs]))
-            max_x_worst = float(np.max([r['max_x'] for r in survived_runs]))
-            mean_final_x = float(np.mean([r['final_x'] for r in survived_runs]))
-            max_final_x = float(np.max([r['final_x'] for r in survived_runs]))
-            mean_rms_pwm = float(np.mean([r['rms_pwm'] for r in survived_runs]))
-        else:
-            mean_max_x = 1.0
-            max_x_worst = 1.0
-            mean_final_x = 1.0
-            max_final_x = 1.0
-            mean_rms_pwm = 999.0
-
-        mean_settle = float(np.mean([r['settling_time'] for r in held_runs])) if held_runs else None
+        group_summaries = {
+            'no_kick': self._summarize_subset(no_kick_runs),
+            'with_kick': self._summarize_subset(with_kick_runs),
+            'long_drift': self._summarize_subset(long_drift_runs),
+        }
 
         # Khóa xếp hạng ưu tiên nghiêm ngặt:
         # 1) Ít ngã nhất  2) Nhiều ca giữ vị trí đạt nhất  3) Sai số vị trí cuối thấp nhất
         ranking_key = (
-            -fall_count,
-            hold_count,
-            -round(mean_final_x, 6),
-            round(mean_survive_s, 4),
-            -round(mean_rms_pwm, 2),
+            -overall['fall_count'],
+            overall['hold_count'],
+            -round(overall['mean_final_x_m'], 6),
+            round(overall['mean_survive_s'], 4),
+            -round(overall['mean_rms_pwm'], 2),
         )
 
         summary = {
-            'total_runs': total_runs,
-            'fall_count': fall_count,
-            'fall_rate_pct': fall_rate,
-            'hold_count': hold_count,
-            'hold_rate_pct': hold_rate,
-            'mean_max_x_m': mean_max_x,
-            'max_x_worst_m': max_x_worst,
-            'mean_final_x_m': mean_final_x,
-            'max_final_x_m': max_final_x,
-            'mean_settle_s': mean_settle,
-            'mean_survive_s': mean_survive_s,
-            'mean_rms_pwm': mean_rms_pwm,
+            **overall,
+            'group_summaries': group_summaries,
             'ranking_key': ranking_key,
             'detailed_results': results
         }
 
         return summary
 
-    def format_report(self, summary):
+    def check_deploy_gate(self, summary, gate_mode='real_robot'):
+        """
+        Kiểm tra điều kiện an toàn trước khi cho phép ghi đè header STM32 (Project_self).
+        gate_mode:
+          - 'real_robot': Nhóm không nhiễu 10s (18/18 đạt, 0 ngã) + chạy dài không nhiễu (4/4 đạt, 0 ngã)
+                          + 2 ca 0° ±1.5 N (2/2 đạt, 0 ngã).
+          - 'no_kick':    Nhóm không nhiễu 10s (18/18 đạt, 0 ngã) + chạy dài không nhiễu (4/4 đạt, 0 ngã).
+          - 'all':        Toàn bộ ma trận 0 ngã và giữ vị trí đạt >= 80%.
+        """
+        reasons = []
+        results = summary.get('detailed_results', [])
+        if summary.get('total_runs', 0) < 90:
+            return False, ["[✗] Thiếu dữ liệu ma trận đánh giá đầy đủ (chỉ có quick_eval)."]
+
+        groups = summary.get('group_summaries', {})
+        no_kick_sum = groups.get('no_kick', self._summarize_subset([]))
+        long_no_kick = [r for r in results if r.get('is_long') and abs(r['kick']) < 1e-6]
+        long_no_kick_sum = self._summarize_subset(long_no_kick)
+        zero_kick = [
+            r for r in results
+            if (not r.get('is_long')) and abs(r['init_theta']) < 1e-6 and abs(abs(r['kick']) - 1.5) < 1e-6
+        ]
+        zero_kick_sum = self._summarize_subset(zero_kick)
+
+        passed = True
+        if gate_mode in ('real_robot', 'no_kick'):
+            nk_ok = (no_kick_sum['total_runs'] > 0 and no_kick_sum['fall_count'] == 0 and no_kick_sum['hold_count'] == no_kick_sum['total_runs'])
+            reasons.append(
+                f"[{'✓' if nk_ok else '✗'}] Không nhiễu 10s: ngã {no_kick_sum['fall_count']}/{no_kick_sum['total_runs']}, "
+                f"giữ VT {no_kick_sum['hold_count']}/{no_kick_sum['total_runs']}"
+            )
+            passed = passed and nk_ok
+
+            lnk_ok = (long_no_kick_sum['total_runs'] > 0 and long_no_kick_sum['fall_count'] == 0 and long_no_kick_sum['hold_count'] == long_no_kick_sum['total_runs'])
+            reasons.append(
+                f"[{'✓' if lnk_ok else '✗'}] Chạy dài không nhiễu (25–30s): ngã {long_no_kick_sum['fall_count']}/{long_no_kick_sum['total_runs']}, "
+                f"giữ VT {long_no_kick_sum['hold_count']}/{long_no_kick_sum['total_runs']}"
+            )
+            passed = passed and lnk_ok
+
+            if gate_mode == 'real_robot':
+                zk_ok = (zero_kick_sum['total_runs'] > 0 and zero_kick_sum['fall_count'] == 0 and zero_kick_sum['hold_count'] == zero_kick_sum['total_runs'])
+                zk_final_txt = (
+                    f"Final X max {zero_kick_sum['max_final_x_m']*100:.2f} cm"
+                    if zero_kick_sum.get('has_survivors') else "Ngã hết"
+                )
+                reasons.append(
+                    f"[{'✓' if zk_ok else '✗'}] Cú đẩy 0° (±1.5 N): ngã {zero_kick_sum['fall_count']}/{zero_kick_sum['total_runs']}, "
+                    f"giữ VT {zero_kick_sum['hold_count']}/{zero_kick_sum['total_runs']} ({zk_final_txt})"
+                )
+                passed = passed and zk_ok
+        elif gate_mode == 'all':
+            all_ok = (summary['fall_count'] == 0 and summary['hold_rate_pct'] >= 80.0)
+            reasons.append(
+                f"[{'✓' if all_ok else '✗'}] Toàn bộ 98 ca: ngã {summary['fall_count']}/{summary['total_runs']}, "
+                f"giữ VT {summary['hold_count']}/{summary['total_runs']} ({summary['hold_rate_pct']:.1f}%)"
+            )
+            passed = all_ok
+        else:
+            raise ValueError(f"Chế độ deploy gate không hợp lệ: {gate_mode}")
+
+        return passed, reasons
+
+    @staticmethod
+    def _fmt_cm_pair(subset_sum, metric_mean_key, metric_max_key):
+        if not subset_sum.get('has_survivors', True):
+            return "Ngã hết"
+        return f"{subset_sum[metric_mean_key]*100:.2f} / {subset_sum[metric_max_key]*100:.2f} cm"
+
+    def format_report(self, summary, deploy_gate_mode='real_robot'):
         r = summary
         std_count = sum(1 for res in r['detailed_results'] if not res.get('is_long', False))
         long_results = [res for res in r['detailed_results'] if res.get('is_long', False)]
         settle_str = f"{r['mean_settle_s']:.2f} s" if r['mean_settle_s'] is not None else "Không đạt"
 
+        gate_passed, gate_reasons = self.check_deploy_gate(r, gate_mode=deploy_gate_mode)
+        gate_badge = "ĐẠT (Đủ điều kiện xuất STM32)" if gate_passed else "CHƯA ĐẠT (Chặn ghi đè STM32)"
+
         lines = []
         lines.append("### BÁO CÁO ĐÁNH GIÁ ĐỘC LẬP CHÙM BÀI TEST TOÀN DIỆN")
         lines.append(
             f"- **Tổng số ca kiểm thử:** {r['total_runs']} kịch bản "
-            f"({std_count} ca {self.duration:.0f}s + {len(long_results)} ca dài 20–30s, Seed cố định)"
+            f"({std_count} ca {self.duration:.0f}s [gồm 90 ma trận + 2 ca 0° ±1.5 N] + {len(long_results)} ca dài 20–30s, Seed cố định)"
         )
+        lines.append(f"- **Cổng kiểm tra STM32 (`{deploy_gate_mode}`):** **{gate_badge}**")
+        for reason in gate_reasons:
+            lines.append(f"  - {reason}")
         lines.append(f"- **Tỷ lệ ngã (Fall Rate):** {r['fall_rate_pct']:.1f}% ({r['fall_count']}/{r['total_runs']} bài ngã)")
         lines.append(
             f"- **Giữ vị trí đạt (|θ| ≤ {self.hold_angle_deg:.1f}°, |x| ≤ {self.hold_pos_m*100:.0f} cm trong {self.hold_window_s:.0f}s cuối):** "
@@ -228,7 +342,31 @@ class PolicyEvaluator:
         lines.append(f"- **Thời gian ổn định TB (trên ca đạt):** {settle_str}")
         lines.append(f"- **RMS PWM trung bình:** {r['mean_rms_pwm']:.1f} / 999")
 
-        lines.append("\n#### Các kịch bản 10s tại điện áp danh định 7.4V")
+        groups = r.get('group_summaries', {})
+        if groups:
+            lines.append("\n#### Phân Tích Theo Nhóm Kịch Bản (Không nhiễu / Có nhiễu / Chạy dài 20–30s)")
+            lines.append("| Nhóm kịch bản | Số ca | Ngã | Giữ VT (2s cuối) | Max X (TB / Xấu nhất) | Final X (TB / Xấu nhất) | Settle TB (đạt) |")
+            lines.append("|:---|:---:|:---:|:---:|:---:|:---:|:---:|")
+            group_labels = [
+                ('no_kick', 'Không nhiễu 10s (kick = 0 N)'),
+                ('with_kick', 'Có nhiễu 10s (gồm 0° ±1.5 N)'),
+                ('long_drift', 'Chạy dài 20–30s (bắt trôi chậm)'),
+            ]
+            for gkey, gtitle in group_labels:
+                gs = groups.get(gkey)
+                if not gs or gs['total_runs'] == 0:
+                    continue
+                g_settle = f"{gs['mean_settle_s']:.2f}s" if gs['mean_settle_s'] is not None else "Không đạt"
+                lines.append(
+                    f"| {gtitle} | {gs['total_runs']} | "
+                    f"{gs['fall_count']}/{gs['total_runs']} ({gs['fall_rate_pct']:.1f}%) | "
+                    f"{gs['hold_count']}/{gs['total_runs']} ({gs['hold_rate_pct']:.1f}%) | "
+                    f"{self._fmt_cm_pair(gs, 'mean_max_x_m', 'max_x_worst_m')} | "
+                    f"{self._fmt_cm_pair(gs, 'mean_final_x_m', 'max_final_x_m')} | "
+                    f"{g_settle} |"
+                )
+
+        lines.append("\n#### Các kịch bản 10s tại điện áp danh định 7.4V (gồm 2 ca 0° ±1.5 N)")
         lines.append("| Góc đầu | Nhiễu (N) | Pin | Sống sót | Max Theta | Max X | Final X | Giữ VT (2s cuối) | Settling | RMS PWM |")
         lines.append("|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
 

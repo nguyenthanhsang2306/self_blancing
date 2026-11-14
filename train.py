@@ -20,6 +20,8 @@ def train():
     parser.add_argument("--timesteps", type=int, default=None, help="Override training timesteps")
     parser.add_argument("--w-pos", type=float, default=None, help="Override reward_weights.w_pos")
     parser.add_argument("--tag", type=str, default=None, help="Optional suffix tag for checkpoint and header outputs")
+    parser.add_argument("--deploy-gate", type=str, default="real_robot", choices=["real_robot", "no_kick", "all"], help="Gate criteria before updating canonical best_policy.npz / STM32 header")
+    parser.add_argument("--update-stm32-header", action="store_true", help="Explicitly sync canonical STM32 header (still blocked unless deploy gate passes and untagged)")
     parser.add_argument("--demo-sample", action="store_true", help="Generate mock weights for testing without training")
     args = parser.parse_args()
 
@@ -115,12 +117,13 @@ def train():
 
     ckpt_dir = config['export']['checkpoint_dir']
     os.makedirs(ckpt_dir, exist_ok=True)
-    tag_suffix = f"_{args.tag}" if args.tag else ""
-    best_npz_path = os.path.join(ckpt_dir, f"best_policy{tag_suffix}.npz")
-    final_npz_path = os.path.join(ckpt_dir, f"final_policy{tag_suffix}.npz")
-    final_sb3_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_final_model{tag_suffix}.zip")
+    run_label = args.tag if args.tag else "candidate"
+    run_suffix = f"_{run_label}"
+    best_npz_path = os.path.join(ckpt_dir, f"best_policy{run_suffix}.npz" if args.tag else "candidate_best_policy.npz")
+    final_npz_path = os.path.join(ckpt_dir, f"final_policy{run_suffix}.npz" if args.tag else "candidate_final_policy.npz")
+    final_sb3_path = os.path.join(ckpt_dir, f"{algo_name.lower()}_final_model{run_suffix}.zip")
 
-    # Xóa checkpoint cũ của các lần train trước để chỉ chọn checkpoint trong lần train hiện tại
+    # Xóa checkpoint cũ của cùng nhãn chạy để chỉ chọn checkpoint trong lần train hiện tại
     if os.path.exists(best_npz_path):
         os.remove(best_npz_path)
         print(f"[Cleanup] Đã xóa checkpoint cũ {best_npz_path} để tránh dùng nhầm kết quả đợt train trước.")
@@ -190,30 +193,53 @@ def train():
     else:
         print("[Notice] Sử dụng final model trong phiên chạy hiện tại.")
 
-    # Đánh giá độc lập toàn diện (90 ca 10s + 6 ca dài 20–30s) trên Checkpoint tốt nhất
+    # Đánh giá độc lập toàn diện (90 ca 10s + 2 ca 0° ±1.5N + 6 ca dài 20–30s) trên Checkpoint tốt nhất
     print("\n" + "=" * 78)
-    print("      ĐÁNH GIÁ ĐỘC LẬP TOÀN DIỆN TRÊN CHECKPOINT TỐT NHẤT (96 BÀI TEST) ")
+    print("      ĐÁNH GIÁ ĐỘC LẬP TOÀN DIỆN TRÊN CHECKPOINT TỐT NHẤT (98 KỊCH BẢN) ")
     print("=" * 78)
     summary = evaluator.evaluate(numpy_policy, quick_eval=False)
-    report = evaluator.format_report(summary)
+    report = evaluator.format_report(summary, deploy_gate_mode=args.deploy_gate)
     print("\n" + report + "\n")
 
-    # XUẤT C HEADER SAU KHI ĐÃ ĐÁNH GIÁ VÀ XÁC NHẬN CHẤT LƯỢNG
+    report_path = os.path.join("outputs", "reports", f"eval_report_{run_label}.md")
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as rf:
+        rf.write(report + "\n")
+    print(f"[Report] Đã lưu báo cáo đánh giá sang: {report_path}")
+
+    # XUẤT C HEADER SAU KHI ĐÃ ĐÁNH GIÁ VÀ KIỂM TRA CỔNG AN TOÀN STM32
     hdr_dir = config['export']['header_output_dir']
     base_hdr = config['export'].get('header_filename', 'rl_sb3_stm32.h')
-    if args.tag:
-        stem, ext = os.path.splitext(base_hdr)
-        hdr_name = f"{stem}{tag_suffix}{ext}"
-    else:
-        hdr_name = base_hdr
-    hdr_path = os.path.join(hdr_dir, hdr_name)
-    export_sb3_c_header(numpy_policy, hdr_path)
+    stem, ext = os.path.splitext(base_hdr)
+    scoped_hdr_name = f"{stem}_{run_label}{ext}"
+    scoped_hdr_path = os.path.join(hdr_dir, scoped_hdr_name)
+    export_sb3_c_header(numpy_policy, scoped_hdr_path)
 
-    if not args.tag:
-        stm32_inc = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Project_self", "Core", "Inc", base_hdr))
-        if os.path.isdir(os.path.dirname(stm32_inc)):
-            export_sb3_c_header(numpy_policy, stm32_inc)
-            print(f"[Sync] Đã đồng bộ trực tiếp file C Header sang STM32 Project: {stm32_inc}")
+    if args.tag:
+        if args.update_stm32_header:
+            print("[Notice] Bỏ qua --update-stm32-header khi đang chạy ở chế độ --tag (chỉ xuất file riêng có nhãn).")
+        print(f"[Tag Mode] Đã xuất bản có nhãn tại {best_npz_path} & {scoped_hdr_path}. Giữ nguyên rl_sb3_stm32.h và Project_self.")
+    else:
+        passed, reasons = evaluator.check_deploy_gate(summary, gate_mode=args.deploy_gate)
+        if passed:
+            best_dst = os.path.join(ckpt_dir, "best_policy.npz")
+            numpy_policy.save_weights(best_dst)
+            canonical_hdr_path = os.path.join(hdr_dir, base_hdr)
+            export_sb3_c_header(numpy_policy, canonical_hdr_path)
+            print(f"[Deploy Gate PASSED] Đã cập nhật {best_dst} và {canonical_hdr_path}.")
+            stm32_inc = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Project_self", "Core", "Inc", base_hdr))
+            if os.path.isdir(os.path.dirname(stm32_inc)):
+                if args.update_stm32_header:
+                    export_sb3_c_header(numpy_policy, stm32_inc)
+                    print(f"[Sync] Đã đồng bộ trực tiếp file C Header sang STM32 Project: {stm32_inc}")
+                else:
+                    print(f"[Sync Skipped] Model đã đạt gate '{args.deploy_gate}', thêm --update-stm32-header nếu muốn chép trực tiếp sang {stm32_inc}")
+        else:
+            print(
+                f"[Gate Blocked] Model ứng viên CHƯA ĐẠT tiêu chí xuất STM32 (gate='{args.deploy_gate}'):\n"
+                + "\n".join(f"  {r}" for r in reasons)
+                + f"\n  -> Chỉ lưu bản ứng viên tại {best_npz_path} & {scoped_hdr_path}; KHÔNG ghi đè best_policy.npz, {base_hdr} hay Project_self."
+            )
 
     print("[Done] Huấn luyện, đánh giá độc lập và xuất mô hình hoàn tất 100%!")
 
