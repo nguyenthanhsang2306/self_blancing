@@ -172,6 +172,37 @@ class PolicyEvaluator:
             'mean_rms_pwm': mean_rms_pwm,
         }
 
+    def _build_summary(self, results):
+        """Tổng hợp chỉ số tổng thể, theo nhóm và khóa xếp hạng từ danh sách kết quả ca."""
+        overall = self._summarize_subset(results)
+
+        no_kick_runs = [r for r in results if (not r['is_long']) and abs(r['kick']) < 1e-6]
+        with_kick_runs = [r for r in results if (not r['is_long']) and abs(r['kick']) >= 1e-6]
+        long_drift_runs = [r for r in results if r['is_long']]
+
+        group_summaries = {
+            'no_kick': self._summarize_subset(no_kick_runs),
+            'with_kick': self._summarize_subset(with_kick_runs),
+            'long_drift': self._summarize_subset(long_drift_runs),
+        }
+
+        # Khóa xếp hạng ưu tiên nghiêm ngặt:
+        # 1) Ít ngã nhất  2) Nhiều ca giữ vị trí đạt nhất  3) Sai số vị trí cuối thấp nhất
+        ranking_key = (
+            -overall['fall_count'],
+            overall['hold_count'],
+            -round(overall['mean_final_x_m'], 6),
+            round(overall['mean_survive_s'], 4),
+            -round(overall['mean_rms_pwm'], 2),
+        )
+
+        return {
+            **overall,
+            'group_summaries': group_summaries,
+            'ranking_key': ranking_key,
+            'detailed_results': results,
+        }
+
     def evaluate(self, policy, quick_eval=False, include_long=True):
         """
         Đánh giá độc lập với bộ Seed cố định (Independent Evaluation Suite):
@@ -211,36 +242,60 @@ class PolicyEvaluator:
                 res = self.evaluate_single_run(policy, th, k, v, duration=long_dur, eval_seed=case_seed)
                 results.append(res)
 
-        overall = self._summarize_subset(results)
+        return self._build_summary(results)
 
-        no_kick_runs = [r for r in results if (not r['is_long']) and abs(r['kick']) < 1e-6]
-        with_kick_runs = [r for r in results if (not r['is_long']) and abs(r['kick']) >= 1e-6]
-        long_drift_runs = [r for r in results if r['is_long']]
+    def evaluate_no_kick_screen(self, policy):
+        """
+        Sàng lọc giai đoạn 2 (22 ca không nhiễu):
+          - 18 ca không nhiễu 10s (6 góc × 3 mức pin) với đúng seed 5000+id
+          - 4 ca chạy dài không nhiễu 25–30s với đúng seed 6000+idx
+        """
+        results = []
+        test_case_id = 0
+        for v in self.test_vbats:
+            for k in self.test_kicks:
+                for th in self.test_angles:
+                    test_case_id += 1
+                    if abs(k) < 1e-6:
+                        case_seed = 5000 + test_case_id
+                        res = self.evaluate_single_run(
+                            policy, th, k, v, duration=self.duration, eval_seed=case_seed
+                        )
+                        results.append(res)
 
-        group_summaries = {
-            'no_kick': self._summarize_subset(no_kick_runs),
-            'with_kick': self._summarize_subset(with_kick_runs),
-            'long_drift': self._summarize_subset(long_drift_runs),
-        }
+        for idx, (th, k, v, long_dur) in enumerate(self.long_scenarios, start=1):
+            if abs(k) < 1e-6:
+                case_seed = 6000 + idx
+                res = self.evaluate_single_run(
+                    policy, th, k, v, duration=long_dur, eval_seed=case_seed
+                )
+                results.append(res)
 
-        # Khóa xếp hạng ưu tiên nghiêm ngặt:
-        # 1) Ít ngã nhất  2) Nhiều ca giữ vị trí đạt nhất  3) Sai số vị trí cuối thấp nhất
-        ranking_key = (
-            -overall['fall_count'],
-            overall['hold_count'],
-            -round(overall['mean_final_x_m'], 6),
-            round(overall['mean_survive_s'], 4),
-            -round(overall['mean_rms_pwm'], 2),
-        )
+        return self._build_summary(results)
 
-        summary = {
-            **overall,
-            'group_summaries': group_summaries,
-            'ranking_key': ranking_key,
-            'detailed_results': results
-        }
+    def select_top_candidates(self, candidates, top_full=2):
+        """
+        Chọn checkpoint 2 bước:
+          1) Chấm tất cả ứng viên trên 22 ca không nhiễu (18 ca 10s + 4 ca dài).
+          2) Lấy top `top_full` bản đứng đầu đem chấm đủ 98 ca và xếp hạng lại.
+        Mỗi phần tử trong `candidates` là dict chứa tối thiểu 'label' và 'policy'.
+        """
+        screened = []
+        for cand in candidates:
+            rec = dict(cand)
+            rec['screen_summary'] = self.evaluate_no_kick_screen(cand['policy'])
+            screened.append(rec)
 
-        return summary
+        screened.sort(key=lambda r: r['screen_summary']['ranking_key'], reverse=True)
+
+        top_full_records = []
+        for rec in screened[:max(1, top_full)]:
+            full_rec = dict(rec)
+            full_rec['full_summary'] = self.evaluate(rec['policy'], quick_eval=False)
+            top_full_records.append(full_rec)
+
+        top_full_records.sort(key=lambda r: r['full_summary']['ranking_key'], reverse=True)
+        return screened, top_full_records
 
     def check_deploy_gate(self, summary, gate_mode='real_robot'):
         """
@@ -397,5 +452,48 @@ class PolicyEvaluator:
                     f"{status} | {res['max_deg']:.2f}° | {res['max_x']*100:.1f} cm | "
                     f"{res['final_x']*100:.2f} cm | {hold_txt} | {settle_cell} | {res['rms_pwm']:.0f} |"
                 )
+
+        return "\n".join(lines)
+
+    def format_two_stage_report(self, screened_records, full_records, deploy_gate_mode='real_robot'):
+        """Định dạng bảng chọn checkpoint 2 bước: Giai đoạn 2 (22 ca không nhiễu) -> Top 2 (98 ca)."""
+        lines = []
+        lines.append("### CHỌN CHECKPOINT 2 BƯỚC (SÀNG LỌC 22 CA KHÔNG NHIỄU -> TOP 2 TRÊN 98 CA)")
+        lines.append("#### Giai đoạn 2: Sàng lọc trên 18 ca không nhiễu 10s + 4 ca dài không nhiễu (22 ca)")
+        lines.append("| Hạng 22 ca | Checkpoint | Quick 6s (Ngã / Giữ VT) | 22 ca Ngã | 22 ca Giữ VT | Final X TB (22 ca) | 10s NoKick Ngã | Dài NoKick Ngã |")
+        lines.append("|:---:|:---|:---:|:---:|:---:|:---:|:---:|:---:|")
+        for rank, rec in enumerate(screened_records, start=1):
+            ss = rec['screen_summary']
+            sg = ss.get('group_summaries', {})
+            nk = sg.get('no_kick', {})
+            lnk = sg.get('long_drift', {})
+            qs = rec.get('quick_summary')
+            quick_txt = f"{qs['fall_count']}/{qs['total_runs']} | {qs['hold_count']}/{qs['total_runs']}" if qs else "N/A"
+            lines.append(
+                f"| #{rank} | {rec['label']} | {quick_txt} | "
+                f"{ss['fall_count']}/{ss['total_runs']} | {ss['hold_count']}/{ss['total_runs']} | "
+                f"{self._fmt_cm_pair(ss, 'mean_final_x_m', 'max_final_x_m')} | "
+                f"{nk.get('fall_count', 0)}/{nk.get('total_runs', 0)} | "
+                f"{lnk.get('fall_count', 0)}/{lnk.get('total_runs', 0)} |"
+            )
+
+        lines.append("\n#### Giai đoạn 3: Chấm đủ 98 ca cho 2 bản đứng đầu")
+        lines.append("| Hạng 98 ca | Checkpoint | Ngã (98 ca) | Giữ VT (98 ca) | Final X TB / Max | Không nhiễu 10s | Chạy dài 20–30s | Cổng STM32 |")
+        lines.append("|:---:|:---|:---:|:---:|:---:|:---:|:---:|:---:|")
+        for rank, rec in enumerate(full_records, start=1):
+            fs = rec['full_summary']
+            fg = fs.get('group_summaries', {})
+            nk = fg.get('no_kick', {})
+            ld = fg.get('long_drift', {})
+            gate_ok, _ = self.check_deploy_gate(fs, gate_mode=deploy_gate_mode)
+            lines.append(
+                f"| #{rank} | {rec['label']} | "
+                f"{fs['fall_count']}/{fs['total_runs']} ({fs['fall_rate_pct']:.1f}%) | "
+                f"{fs['hold_count']}/{fs['total_runs']} ({fs['hold_rate_pct']:.1f}%) | "
+                f"{self._fmt_cm_pair(fs, 'mean_final_x_m', 'max_final_x_m')} | "
+                f"Ngã {nk.get('fall_count', 0)}/{nk.get('total_runs', 0)}, Giữ {nk.get('hold_count', 0)}/{nk.get('total_runs', 0)} | "
+                f"Ngã {ld.get('fall_count', 0)}/{ld.get('total_runs', 0)}, Giữ {ld.get('hold_count', 0)}/{ld.get('total_runs', 0)} | "
+                f"{'ĐẠT' if gate_ok else 'CHƯA ĐẠT'} |"
+            )
 
         return "\n".join(lines)
