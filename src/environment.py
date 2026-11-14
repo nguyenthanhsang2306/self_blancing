@@ -107,6 +107,11 @@ class SelfBalancingGymEnv(gym.Env):
         self.w_action = rw.get('w_action', 0.015)
         self.w_action_diff = rw.get('w_action_diff', 1.50)
         self.fall_penalty = rw.get('fall_penalty', 100.0)
+        # Phạt thêm vận tốc liên tục khi gần thẳng & gần gốc (giảm dao động, không cản phản xạ lúc vừa bị đẩy)
+        self.near_origin_vel_max = float(rw.get('near_origin_vel_max', 0.02))
+        self.near_origin_pos_m = float(rw.get('near_origin_pos_m', 0.05))
+        self.near_origin_theta_rad = math.radians(float(rw.get('near_origin_theta_deg', 2.0)))
+        self.near_origin_vel_mps = float(rw.get('near_origin_vel_mps', 0.03))
 
         # Observation Space
         if self.obs_mode == '9d':
@@ -364,8 +369,16 @@ class SelfBalancingGymEnv(gym.Env):
             else 0.0
         )
 
+        near_vel_penalty = 0.0
+        if self.near_origin_vel_max > 0.0:
+            pos_gate = math.exp(-((dx / max(self.near_origin_pos_m, 1e-6)) ** 2))
+            theta_gate = math.exp(-((theta / max(self.near_origin_theta_rad, 1e-6)) ** 2))
+            vel_factor = math.tanh(abs(v) / max(self.near_origin_vel_mps, 1e-6))
+            near_vel_penalty = self.near_origin_vel_max * pos_gate * theta_gate * vel_factor
+
         reward = (alive_reward
                   + hold_bonus
+                  - near_vel_penalty
                   - self.w_theta * (theta ** 2)
                   - self.w_dtheta * (dtheta ** 2)     # Dập tắt lắc lư hình sin
                   - self.w_pos * (dx ** 2)           # Khóa vị trí đứng yên x = 0

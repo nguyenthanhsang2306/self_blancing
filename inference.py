@@ -147,6 +147,21 @@ def run_inference():
         print(zero_block)
         md_sections.append(zero_block)
 
+        hp_entries = []
+        for path, pol, _ in compared:
+            hp_entries.append({
+                'label': os.path.basename(path),
+                'hold30': evaluator.evaluate_hold30(pol),
+                'push_dev': evaluator.evaluate_push_seeds(pol, seeds=range(7000, 7010)),
+                'push_confirm': evaluator.evaluate_push_seeds(pol, seeds=range(7100, 7110)),
+            })
+        hp_block = "\n## 4. " + evaluator.format_hold_push_comparison(
+            hp_entries,
+            title="Đối Chiếu 30 Ca Giữ Vị Trí & 20+20 Ca Đẩy Đa Seed (7000–7009 & 7100–7109)",
+        ).lstrip("# ")
+        print("\n" + hp_block)
+        md_sections.append(hp_block)
+
         best_path, best_pol, best_summ = compared[0]
         print(f"\n[Winner] Bản xếp hạng #1: {best_path}")
         winner_report = evaluator.format_report(best_summ, deploy_gate_mode=args.deploy_gate)

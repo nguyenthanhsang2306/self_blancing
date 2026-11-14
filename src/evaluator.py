@@ -62,13 +62,13 @@ class PolicyEvaluator:
                 settling_time = 0.0 if last_violation_idx == -1 else float(t_hist[last_violation_idx + 1])
         return position_held, settling_time
 
-    def evaluate_single_run(self, policy, init_theta_deg, kick_n, vbat_v, duration=10.0, eval_seed=1001):
+    def evaluate_single_run(self, policy, init_theta_deg, kick_n, vbat_v, duration=10.0, eval_seed=1001, init_x_m=0.0):
         env = SelfBalancingGymEnv(self.config, seed=eval_seed)
         steps = int(duration / env.Ts)
 
         obs, _ = env.reset(seed=eval_seed, options={
             'init_theta_deg': init_theta_deg,
-            'init_x': 0.0,
+            'init_x': init_x_m,
             'v_bat': vbat_v,
             'fixed_physics': True
         })
@@ -110,10 +110,15 @@ class PolicyEvaluator:
         final_x = float(abs(x_hist[-1]))
         rms_pwm = float(np.sqrt(np.mean(np.square(pwm_hist))))
 
+        hold_steps = max(1, int(round(min(self.hold_window_s, duration) / env.Ts)))
+        max_x_2s = float(np.max(np.abs(x_hist[-hold_steps:])))
+        max_deg_2s = float(np.max(np.abs(theta_hist[-hold_steps:])))
+
         position_held, settling_time = self.compute_hold_metrics(t_hist, theta_hist, x_hist, fallen, duration)
 
         return {
             'init_theta': init_theta_deg,
+            'init_x': init_x_m,
             'kick': kick_n,
             'vbat': vbat_v,
             'duration': duration,
@@ -122,8 +127,10 @@ class PolicyEvaluator:
             'position_held': position_held,
             'survive_time': survive_time,
             'max_deg': max_deg,
+            'max_deg_2s': max_deg_2s,
             'final_deg': final_deg,
             'max_x': max_x,
+            'max_x_2s': max_x_2s,
             'final_x': final_x,
             'settling_time': settling_time,
             'rms_pwm': rms_pwm
@@ -143,12 +150,16 @@ class PolicyEvaluator:
         if survived_runs:
             mean_max_x = float(np.mean([r['max_x'] for r in survived_runs]))
             max_x_worst = float(np.max([r['max_x'] for r in survived_runs]))
+            mean_max_x_2s = float(np.mean([r.get('max_x_2s', r['final_x']) for r in survived_runs]))
+            worst_max_x_2s = float(np.max([r.get('max_x_2s', r['final_x']) for r in survived_runs]))
             mean_final_x = float(np.mean([r['final_x'] for r in survived_runs]))
             max_final_x = float(np.max([r['final_x'] for r in survived_runs]))
             mean_rms_pwm = float(np.mean([r['rms_pwm'] for r in survived_runs]))
         else:
             mean_max_x = 1.0
             max_x_worst = 1.0
+            mean_max_x_2s = 1.0
+            worst_max_x_2s = 1.0
             mean_final_x = 1.0
             max_final_x = 1.0
             mean_rms_pwm = 999.0
@@ -165,6 +176,8 @@ class PolicyEvaluator:
             'hold_rate_pct': hold_rate,
             'mean_max_x_m': mean_max_x,
             'max_x_worst_m': max_x_worst,
+            'mean_max_x_2s_m': mean_max_x_2s,
+            'worst_max_x_2s_m': worst_max_x_2s,
             'mean_final_x_m': mean_final_x,
             'max_final_x_m': max_final_x,
             'mean_settle_s': mean_settle,
@@ -496,4 +509,89 @@ class PolicyEvaluator:
                 f"{'ĐẠT' if gate_ok else 'CHƯA ĐẠT'} |"
             )
 
+        return "\n".join(lines)
+
+    def evaluate_hold30(self, policy, offsets_cm=(-10, -5, -2, 2, 5, 10), offset_seed=5001):
+        """
+        Bộ 30 ca giữ vị trí chuẩn:
+          - 6 ca lệch gốc (±2, ±5, ±10 cm @ 0°, 7.4V, 10s, seed=5001)
+          - 18 ca không nhiễu 10s (seed 5000+id)
+          - 6 ca chạy dài 20–30s (seed 6000+idx)
+        """
+        offset_runs = []
+        for x0_cm in offsets_cm:
+            res = self.evaluate_single_run(
+                policy, 0.0, 0.0, 7.4, duration=self.duration, eval_seed=offset_seed, init_x_m=x0_cm / 100.0
+            )
+            offset_runs.append(res)
+
+        no_kick_10s = []
+        cid = 0
+        for v in self.test_vbats:
+            for k in self.test_kicks:
+                for th in self.test_angles:
+                    cid += 1
+                    if abs(k) < 1e-6:
+                        res = self.evaluate_single_run(
+                            policy, th, 0.0, v, duration=self.duration, eval_seed=5000 + cid
+                        )
+                        no_kick_10s.append(res)
+
+        long_runs = []
+        for idx, (th, k, v, long_dur) in enumerate(self.long_scenarios, start=1):
+            res = self.evaluate_single_run(policy, th, k, v, duration=long_dur, eval_seed=6000 + idx)
+            long_runs.append(res)
+
+        all_runs = offset_runs + no_kick_10s + long_runs
+        summary = self._build_summary(all_runs)
+        summary['subgroups'] = {
+            'offset_6': self._summarize_subset(offset_runs),
+            'no_kick_18': self._summarize_subset(no_kick_10s),
+            'long_6': self._summarize_subset(long_runs),
+        }
+        return summary
+
+    def evaluate_push_seeds(self, policy, seeds=range(7000, 7010), kicks=(1.5, -1.5), vbat=7.4, duration=10.0):
+        """
+        Chấm bộ ca cú đẩy ±1.5 N @ 0°, 7.4V, 10s trên dải seed cố định (mặc định 10 seed × 2 chiều = 20 ca).
+        Ưu tiên theo số ca đạt giữ vị trí và max |x| trong 2 giây cuối.
+        """
+        results = []
+        by_kick = {}
+        for k in kicks:
+            k_runs = []
+            for s in seeds:
+                res = self.evaluate_single_run(policy, 0.0, float(k), vbat, duration=duration, eval_seed=int(s))
+                res['seed'] = int(s)
+                k_runs.append(res)
+                results.append(res)
+            by_kick[float(k)] = self._summarize_subset(k_runs)
+
+        summary = self._build_summary(results)
+        summary['by_kick'] = by_kick
+        return summary
+
+    def format_hold_push_comparison(self, entries, title="Đối Chiếu Giữ Vị Trí (30 ca) & Cú Đẩy Đa Seed (20+20 ca)"):
+        """
+        entries: list of dicts với keys {'label', 'hold30', 'push_dev', 'push_confirm', 'full98'(optional)}
+        """
+        lines = [
+            f"### {title}",
+            "| Checkpoint | 30 ca giữ VT (`offset/18/6`) | 30 ca `max|x|_{2s}` (TB/Max) | Đẩy 7000–7009 (20 ca) | Đẩy 7000–7009 `max|x|_{2s}` | Seed mới 7100–7109 (20 ca) | Seed mới `max|x|_{2s}` |",
+            "|:---|:---:|:---:|:---:|:---:|:---:|:---:|",
+        ]
+        for ent in entries:
+            h30 = ent['hold30']
+            sg = h30['subgroups']
+            pd = ent['push_dev']
+            pc = ent['push_confirm']
+            lines.append(
+                f"| {ent['label']} | "
+                f"**{h30['hold_count']}/30** ({sg['offset_6']['hold_count']}/6, {sg['no_kick_18']['hold_count']}/18, {sg['long_6']['hold_count']}/6) | "
+                f"{self._fmt_cm_pair(h30, 'mean_max_x_2s_m', 'worst_max_x_2s_m')} | "
+                f"**{pd['hold_count']}/20** (+1.5:{pd['by_kick'][1.5]['hold_count']}/10, -1.5:{pd['by_kick'][-1.5]['hold_count']}/10) | "
+                f"{self._fmt_cm_pair(pd, 'mean_max_x_2s_m', 'worst_max_x_2s_m')} | "
+                f"**{pc['hold_count']}/20** (+1.5:{pc['by_kick'][1.5]['hold_count']}/10, -1.5:{pc['by_kick'][-1.5]['hold_count']}/10) | "
+                f"{self._fmt_cm_pair(pc, 'mean_max_x_2s_m', 'worst_max_x_2s_m')} |"
+            )
         return "\n".join(lines)

@@ -173,6 +173,7 @@ def train():
     parser.add_argument("--eval-freq", type=int, default=None, help="Override rl_training.eval_freq in timesteps (e.g. 10000)")
     parser.add_argument("--init-weights", type=str, default=None, help="Path to .npz policy checkpoint to warm-start SB3 actor weights/biases")
     parser.add_argument("--w-pos", type=float, default=None, help="Override reward_weights.w_pos")
+    parser.add_argument("--near-vel-max", type=float, default=None, help="Override reward_weights.near_origin_vel_max (default 0.02 in environment.py)")
     parser.add_argument("--recenter-prob", type=float, default=None, help="Override gym_env.recenter_init_prob (e.g. 0.0 to disable, 0.30 for 30%%)")
     parser.add_argument("--tag", type=str, default=None, help="Optional suffix tag for checkpoint and header outputs")
     parser.add_argument("--top-k", type=int, default=3, help="Number of top quick-eval checkpoints to keep for Stage-2 22-case screening")
@@ -196,6 +197,11 @@ def train():
     if args.w_pos is not None:
         config.setdefault('reward_weights', {})['w_pos'] = float(args.w_pos)
         print(f"[Config Override] reward_weights.w_pos = {config['reward_weights']['w_pos']:.4f}")
+    if args.near_vel_max is not None:
+        if args.near_vel_max < 0.0:
+            parser.error("--near-vel-max must be >= 0")
+        config.setdefault('reward_weights', {})['near_origin_vel_max'] = float(args.near_vel_max)
+        print(f"[Config Override] reward_weights.near_origin_vel_max = {config['reward_weights']['near_origin_vel_max']:.4f}")
     if args.recenter_prob is not None:
         if not 0.0 <= args.recenter_prob <= 1.0:
             parser.error("--recenter-prob must be between 0 and 1")
@@ -557,12 +563,59 @@ def train():
     print("=" * 78)
     screened_records, full_records = evaluator.select_top_candidates(candidates, top_full=top_full_n)
 
-    # Đảm bảo step 0 luôn có mặt trong danh sách 98 ca để tham gia xếp hạng và đối chiếu guard
+    # Đảm bảo step 0 luôn có mặt trong danh sách 98 ca (dùng lại step0_full đã chấm)
     if step0_full is not None and not any(r.get('step') == 0 for r in full_records):
         step0_screen = next((r for r in screened_records if r.get('step') == 0), None)
         if step0_screen is not None:
             full_records.append({**step0_screen, 'full_summary': step0_full})
-            full_records.sort(key=lambda r: r['full_summary']['ranking_key'], reverse=True)
+
+    hold_push_md = ""
+    if step0_full is not None:
+        # Chấm thêm bộ 30 ca giữ VT + 20 ca đẩy 7000–7009 cho TẤT CẢ ứng viên (ưu tiên số ca đạt & max|x|_2s)
+        cand_hp_map = {}
+        for rec in screened_records:
+            h30 = evaluator.evaluate_hold30(rec['policy'])
+            pdev = evaluator.evaluate_push_seeds(rec['policy'], seeds=range(7000, 7010))
+            hp_key = (
+                -(pdev['fall_count'] + h30['fall_count']),
+                pdev['hold_count'] + h30['hold_count'],
+                pdev['hold_count'],
+                h30['hold_count'],
+                -round(pdev['mean_max_x_2s_m'] + h30['mean_max_x_2s_m'], 6),
+                -round(max(pdev['worst_max_x_2s_m'], h30['worst_max_x_2s_m']), 6),
+            )
+            cand_hp_map[rec['step']] = (rec, h30, pdev, hp_key)
+
+        ranked_new_hp = sorted(
+            [v for step_k, v in cand_hp_map.items() if step_k != 0],
+            key=lambda x: x[3],
+            reverse=True,
+        )
+        full_steps_set = {r.get('step') for r in full_records}
+        # Bổ sung Top 2 checkpoint nổi bật theo (30 ca + 20 ca đẩy 7000–7009) vào danh sách chấm 98 ca
+        for rec_hp, _, _, _ in ranked_new_hp[:2]:
+            if rec_hp['step'] not in full_steps_set:
+                full_rec = dict(rec_hp)
+                full_rec['full_summary'] = evaluator.evaluate(rec_hp['policy'], quick_eval=False)
+                full_records.append(full_rec)
+                full_steps_set.add(rec_hp['step'])
+
+        # Xác nhận trên seed mới 7100–7109 cho tất cả ứng viên vòng 98 ca (gồm step 0)
+        full_records.sort(key=lambda r: r['full_summary']['ranking_key'], reverse=True)
+        hp_entries = []
+        for rec in full_records:
+            rec_hp, h30, pdev, _ = cand_hp_map[rec['step']]
+            pconf = evaluator.evaluate_push_seeds(rec['policy'], seeds=range(7100, 7110))
+            hp_entries.append({
+                'label': rec['label'],
+                'hold30': h30,
+                'push_dev': pdev,
+                'push_confirm': pconf,
+            })
+        hold_push_md = evaluator.format_hold_push_comparison(hp_entries)
+        print("\n" + hold_push_md + "\n")
+    else:
+        full_records.sort(key=lambda r: r['full_summary']['ranking_key'], reverse=True)
 
     two_stage_report = evaluator.format_two_stage_report(
         screened_records, full_records, deploy_gate_mode=args.deploy_gate
@@ -601,7 +654,10 @@ def train():
     print("\n" + winner_report + "\n")
     print(winner_gate_gaps_md + "\n")
 
-    report_sections = [two_stage_report, f"**Quyết định chọn checkpoint:** {guard_msg}"]
+    report_sections = [two_stage_report]
+    if hold_push_md:
+        report_sections.append(hold_push_md)
+    report_sections.append(f"**Quyết định chọn checkpoint:** {guard_msg}")
     if step0_gate_gaps_md:
         report_sections.append(step0_gate_gaps_md)
     report_sections.append(winner_gate_gaps_md)
