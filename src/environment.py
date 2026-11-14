@@ -99,6 +99,7 @@ class SelfBalancingGymEnv(gym.Env):
         # Hàm thưởng (Angle-First, Soft Centering)
         rw = config.get('reward_weights', {})
         self.r_alive = rw.get('r_alive', 1.0)
+        self.r_hold_bonus = float(rw.get('r_hold_bonus', 0.05))
         self.w_theta = rw.get('w_theta', 35.0)
         self.w_dtheta = rw.get('w_dtheta', 3.50)
         self.w_pos = rw.get('w_pos', 0.12)
@@ -357,8 +358,14 @@ class SelfBalancingGymEnv(gym.Env):
         dx = x - self.target_x
 
         alive_reward = self.r_alive if abs(theta) < math.radians(6.0) else 0.0
+        hold_bonus = (
+            self.r_hold_bonus
+            if (abs(theta) <= math.radians(0.5) and abs(dx) <= 0.02 and abs(v) <= 0.01)
+            else 0.0
+        )
 
         reward = (alive_reward
+                  + hold_bonus
                   - self.w_theta * (theta ** 2)
                   - self.w_dtheta * (dtheta ** 2)     # Dập tắt lắc lư hình sin
                   - self.w_pos * (dx ** 2)           # Khóa vị trí đứng yên x = 0
