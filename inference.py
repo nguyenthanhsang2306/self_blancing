@@ -223,6 +223,8 @@ def run_inference():
     theta_hist = []
     x_hist = []
     pwm_hist = []
+    pwm_before_deadband_hist = []
+    effective_pwm_hist = []
     fallen = False
 
     steps = int(args.duration / env.Ts)
@@ -243,6 +245,8 @@ def run_inference():
         theta_hist.append(info['theta_deg'])
         x_hist.append(info['x_pos'])
         pwm_hist.append(info['applied_pwm'])
+        pwm_before_deadband_hist.append(info['u_ppo'])
+        effective_pwm_hist.append(info['effective_pwm'])
 
         if terminated:
             fallen = True
@@ -253,7 +257,11 @@ def run_inference():
     fig_path = args.output_figure if args.output_figure else os.path.join(fig_dir, "rl_inference_test.png")
     fig_path_abs = os.path.abspath(fig_path)
     os.makedirs(os.path.dirname(fig_path_abs), exist_ok=True)
-    plot_simulation_trajectory(t_hist, theta_hist, x_hist, pwm_hist, fig_path_abs)
+    plot_simulation_trajectory(
+        t_hist, theta_hist, x_hist, pwm_hist, fig_path_abs,
+        pwm_before_deadband=pwm_before_deadband_hist,
+        effective_pwm=effective_pwm_hist,
+    )
 
     avg_lat = float(np.mean(latencies))
     max_lat = float(np.max(latencies))

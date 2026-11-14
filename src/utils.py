@@ -159,7 +159,9 @@ def export_sb3_c_header(policy, output_path):
 
     print(f"[Export] Đã xuất thành công C Header sang: {output_path}")
 
-def plot_simulation_trajectory(t_arr, theta_arr, x_arr, pwm_arr, output_path):
+def plot_simulation_trajectory(
+    t_arr, theta_arr, x_arr, pwm_arr, output_path, *, pwm_before_deadband=None, effective_pwm=None
+):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
 
@@ -176,7 +178,11 @@ def plot_simulation_trajectory(t_arr, theta_arr, x_arr, pwm_arr, output_path):
     ax2.grid(True, alpha=0.3)
     ax2.legend(loc='upper right')
 
-    ax3.plot(t_arr, pwm_arr, 'r-', label='Motor Action (PWM)', linewidth=1.2)
+    ax3.plot(t_arr, pwm_arr, color='tab:red', alpha=0.65, label='Applied motor PWM', linewidth=1.0)
+    if pwm_before_deadband is not None:
+        ax3.plot(t_arr, pwm_before_deadband, color='tab:blue', label='Command before deadband compensation', linewidth=1.1)
+    if effective_pwm is not None:
+        ax3.plot(t_arr, effective_pwm, color='black', linestyle='--', label='Effective motor PWM', linewidth=1.0)
     ax3.axhline(0, color='k', linestyle='--', alpha=0.6)
     ax3.set_ylabel("PWM Output")
     ax3.set_xlabel("Time (seconds)")

@@ -19,6 +19,7 @@ def train():
     parser.add_argument("--config", type=str, default="configs/default.yaml", help="Path to default.yaml")
     parser.add_argument("--timesteps", type=int, default=None, help="Override training timesteps")
     parser.add_argument("--w-pos", type=float, default=None, help="Override reward_weights.w_pos")
+    parser.add_argument("--recenter-prob", type=float, default=None, help="Override gym_env.recenter_init_prob (e.g. 0.0 to disable, 0.30 for 30%%)")
     parser.add_argument("--tag", type=str, default=None, help="Optional suffix tag for checkpoint and header outputs")
     parser.add_argument("--deploy-gate", type=str, default="real_robot", choices=["real_robot", "no_kick", "all"], help="Gate criteria before updating canonical best_policy.npz / STM32 header")
     parser.add_argument("--update-stm32-header", action="store_true", help="Explicitly sync canonical STM32 header (still blocked unless deploy gate passes and untagged)")
@@ -34,6 +35,11 @@ def train():
     if args.w_pos is not None:
         config.setdefault('reward_weights', {})['w_pos'] = float(args.w_pos)
         print(f"[Config Override] reward_weights.w_pos = {config['reward_weights']['w_pos']:.4f}")
+    if args.recenter_prob is not None:
+        if not 0.0 <= args.recenter_prob <= 1.0:
+            parser.error("--recenter-prob must be between 0 and 1")
+        config.setdefault('gym_env', {})['recenter_init_prob'] = float(args.recenter_prob)
+        print(f"[Config Override] gym_env.recenter_init_prob = {config['gym_env']['recenter_init_prob']:.2f}")
 
     print("==============================================================================")
     print("      REINFORCEMENT LEARNING FOR SELF-BALANCING ROBOT (SB3 PPO + STM32)      ")

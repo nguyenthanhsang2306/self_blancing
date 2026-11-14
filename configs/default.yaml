@@ -33,7 +33,7 @@ robot_physics:
 gym_env:
   obs_mode: "9d"                # "9d" [s_t, s_{t-1}, a_{t-1}]
   action_mode: "continuous"     # "continuous"
-  max_episode_steps: 1000       # 5.0 giây tại 200 Hz
+  max_episode_steps: 2000       # 10.0 giây tại 200 Hz
   fall_angle_deg: 15.0          # Góc ngắt ván an toàn 15°
   position_limit_m: 1.0         # Giới hạn quãng đường 1.0m
   target_position: 0.0          # Vị trí mục tiêu cần đứng yên (m)

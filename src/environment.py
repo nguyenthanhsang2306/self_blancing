@@ -84,6 +84,7 @@ class SelfBalancingGymEnv(gym.Env):
         self.fall_angle = math.radians(env_cfg.get('fall_angle_deg', 15.0))
         self.pos_limit = env_cfg.get('position_limit_m', 1.0)
         self.target_x = env_cfg.get('target_position', 0.0)
+        self.recenter_prob = float(env_cfg.get('recenter_init_prob', 0.30))
 
         # Domain Randomization
         dr = config.get('domain_randomization', {})
@@ -211,6 +212,10 @@ class SelfBalancingGymEnv(gym.Env):
             init_theta = self.rng.uniform(-math.radians(max_deg), math.radians(max_deg))
 
         init_x = float(options.get('init_x', self.rng.uniform(-0.005, 0.005)))
+        if self.recenter_prob > 0.0 and not options and self.rng.rand() < self.recenter_prob:
+            init_theta = math.radians(self.rng.uniform(-1.0, 1.0))
+            offset = self.rng.uniform(0.02, 0.10)
+            init_x = float(self.rng.choice([-1.0, 1.0]) * offset)
         self.state = np.array([init_theta, 0.0, init_x, 0.0], dtype=np.float32)
 
         # Khởi tạo trạng thái Encoder & LPF
